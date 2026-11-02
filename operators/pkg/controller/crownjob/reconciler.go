@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
@@ -51,7 +52,7 @@ import (
 type Reconciler struct {
 	client.Client
 	// APIReader reads, without cache, the objects that the controller does not watch: the Instance and the objects
-	// it refers to (once, before the Job is created), the pod of the Job and its Kueue Workload.
+	// it refers to (once, before the Job is created), the pod of the Job and the job queues.
 	APIReader      client.Reader
 	TargetLabel    ctrlcommon.KVLabel
 	EventsRecorder record.EventRecorder
@@ -71,6 +72,10 @@ type Reconciler struct {
 	DefaultTimeZone *time.Location
 	// Clock returns the current time: the limits of a Workspace in force depend on it.
 	Clock clock.PassiveClock
+	// Visibility reads the waiting workloads of the job queues, for the queue positions (nil: no queue positions).
+	Visibility VisibilityReader
+	// QueueCache keeps what is read about the job queues for a short time (nil: read at every reconcile).
+	QueueCache *QueueCache
 
 	// This function, if configured, is deferred at the beginning of the Reconcile.
 	// Specifically, it is meant to be set to GinkgoRecover during the tests,
@@ -79,10 +84,18 @@ type Reconciler struct {
 }
 
 // SetupWithManager registers a new controller for CrownJob resources. It watches the CrownJobs and their Jobs (the main
-// Job, with the name of the CrownJob, and the log helpers), and the metadata of the Deployments of the instances, to
-// wake up the jobs that wait for them: pods and Workloads are read when needed, to keep the cache of the operator small.
+// Job, with the name of the CrownJob, and the log helpers), every change of the job queues (their status included:
+// the waiting jobs are reconciled again), and the metadata of the Deployments of the instances, to wake up the jobs
+// that wait for them. Pods and Workloads are read when needed, not watched, to keep the cache of the operator small.
 // The field index of the CrownJobs on their Instance is registered by InstanceReconciler.SetupWithManager.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, concurrency int) error {
+	return r.controllerBuilder(mgr, concurrency).Complete(r)
+}
+
+// controllerBuilder returns the builder of the controller, with its watches.
+func (r *Reconciler) controllerBuilder(mgr ctrl.Manager, concurrency int) *builder.Builder {
+	clusterQueue := &unstructured.Unstructured{}
+	clusterQueue.SetGroupVersionKind(forge.KueueClusterQueueGVK)
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&clv1alpha2.CrownJob{}).
 		Owns(&batchv1.Job{}).
@@ -91,11 +104,11 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, concurrency int) error {
 				_, found := obj.GetLabels()[forge.LabelInstanceKey]
 				return found
 			}))).
+		Watches(clusterQueue, handler.EnqueueRequestsFromMapFunc(r.waitingCrownJobs), builder.WithPredicates(isJobQueue)).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: concurrency,
 		}).
-		WithLogConstructor(utils.LogConstructor(mgr.GetLogger(), "CrownJob")).
-		Complete(r)
+		WithLogConstructor(utils.LogConstructor(mgr.GetLogger(), "CrownJob"))
 }
 
 // Reconcile reconciles the state of a CrownJob resource.
@@ -367,11 +380,13 @@ func isTerminal(phase clv1alpha2.CrownJobPhase) bool {
 	return phase == clv1alpha2.CrownJobPhaseSucceeded || phase == clv1alpha2.CrownJobPhaseFailed
 }
 
-// setStatus sets the phase, reason and message of the status of the given CrownJob.
+// setStatus sets the phase, reason and message of the status of the given CrownJob, and clears its queue position:
+// only a job waiting in the queue of its Workspace has one, set after this call.
 func setStatus(crownJob *clv1alpha2.CrownJob, phase clv1alpha2.CrownJobPhase, reason, message string) {
 	crownJob.Status.Phase = phase
 	crownJob.Status.Reason = reason
 	crownJob.Status.Message = message
+	crownJob.Status.QueuePosition = nil
 }
 
 // shorten returns the given message, cut to maxMessageLength characters.

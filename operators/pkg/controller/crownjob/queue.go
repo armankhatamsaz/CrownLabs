@@ -101,9 +101,6 @@ func (r *QueueReconciler) SetupWithManager(mgr ctrl.Manager, concurrency int) er
 	toQueues := handler.EnqueueRequestsFromMapFunc(func(context.Context, client.Object) []reconcile.Request {
 		return []reconcile.Request{queueReconcileRequest}
 	})
-	isJobQueue := predicate.NewPredicateFuncs(func(obj client.Object) bool {
-		return strings.HasPrefix(obj.GetName(), forge.CrownJobQueuePrefix)
-	})
 
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("crownjob-queue").
@@ -117,6 +114,11 @@ func (r *QueueReconciler) SetupWithManager(mgr ctrl.Manager, concurrency int) er
 		WithLogConstructor(utils.LogConstructor(mgr.GetLogger(), "CrownJobQueue")).
 		Complete(r)
 }
+
+// isJobQueue selects the job queues (the ClusterQueues of the Workspaces) and the root Cohort, by name.
+var isJobQueue = predicate.NewPredicateFuncs(func(obj client.Object) bool {
+	return strings.HasPrefix(obj.GetName(), forge.CrownJobQueuePrefix)
+})
 
 // queueObject is a job queue or the root Cohort, with its current quotas and those to apply.
 type queueObject struct {

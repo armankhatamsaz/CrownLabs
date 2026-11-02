@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2/textlogger"
 	testingclock "k8s.io/utils/clock/testing"
@@ -81,6 +82,7 @@ var (
 	queueReconciler    crownjob.QueueReconciler
 	instanceReconciler crownjob.InstanceReconciler
 	testEnv            *envtest.Environment
+	restConfig         *rest.Config
 	stopManager        context.CancelFunc
 	// testClock is the clock of the reconcilers: Monday 2026-11-02, 12:00 in Rome, unless a test moves it.
 	testClock *testingclock.FakeClock
@@ -106,6 +108,7 @@ var _ = BeforeSuite(func() {
 	cfg, err := testEnv.Start()
 	Expect(err).ToNot(HaveOccurred())
 	Expect(cfg).ToNot(BeNil())
+	restConfig = cfg
 
 	Expect(clv1alpha2.AddToScheme(scheme.Scheme)).NotTo(HaveOccurred())
 	Expect(clv1alpha1.AddToScheme(scheme.Scheme)).NotTo(HaveOccurred())

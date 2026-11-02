@@ -14,6 +14,16 @@
 
 package crownjob
 
+import (
+	"context"
+
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+)
+
 // JobEnvironment exposes jobEnvironment to the tests, for the Templates that the CEL rules of the CRD refuse.
 var JobEnvironment = jobEnvironment
 
@@ -22,3 +32,14 @@ var CrownJobToInstance = crownJobToInstance
 
 // InstanceDeploymentToCrownJobs exposes the map function of the watch on the Deployments of the instances to the tests.
 var InstanceDeploymentToCrownJobs = (*Reconciler).instanceDeploymentToCrownJobs
+
+// SetupWithManagerFor registers the watches of the CrownJob controller on the given manager, with another reconciler:
+// the tests see which requests each change enqueues.
+func (r *Reconciler) SetupWithManagerFor(mgr ctrl.Manager, rec reconcile.Reconciler) error {
+	return r.controllerBuilder(mgr, 1).WithOptions(controller.Options{SkipNameValidation: ptr.To(true)}).Complete(rec)
+}
+
+// Positions exposes the queue positions of a Workspace read through the cache.
+func (c *QueueCache) Positions(ctx context.Context, workspace string, reader VisibilityReader) (map[types.UID]int32, error) {
+	return c.positions(ctx, workspace, reader)
+}

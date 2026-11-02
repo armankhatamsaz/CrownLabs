@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
@@ -91,6 +92,11 @@ func setupCrownJob(mgr manager.Manager, targetLabel ctrlcommon.KVLabel) error {
 	if err := checkKueueKinds(mgr); err != nil {
 		return err
 	}
+	// The queue positions are read from the visibility API of Kueue with plain REST calls.
+	clientset, err := kubernetes.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		return fmt.Errorf("failed creating the client of the visibility API of Kueue: %w", err)
+	}
 
 	if err := (&crownjob.Reconciler{
 		Client:            mgr.GetClient(),
@@ -104,6 +110,8 @@ func setupCrownJob(mgr manager.Manager, targetLabel ctrlcommon.KVLabel) error {
 		Capacity:          capacity,
 		DefaultTimeZone:   timeZone,
 		Clock:             clock.RealClock{},
+		Visibility:        crownjob.NewVisibilityReader(clientset.CoreV1().RESTClient(), crownjob.VisibilityTimeout),
+		QueueCache:        crownjob.NewQueueCache(crownjob.QueueCacheTTL, clock.RealClock{}),
 	}).SetupWithManager(mgr, maxConcurrentCrownJobReconciles); err != nil {
 		return err
 	}

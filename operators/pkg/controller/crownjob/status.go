@@ -37,8 +37,9 @@ import (
 	"github.com/netgroup-polito/CrownLabs/operators/pkg/utils"
 )
 
-// observeJob sets the status of the CrownJob from the state of its Job, reading the pod of the Job and its Kueue
-// Workload only when needed. Once the pod of the Job is read, its log helper is created if needed.
+// observeJob sets the status of the CrownJob from the state of its Job, reading the pod of the Job only when needed,
+// and, while the Job waits, the state of the job queues and the queue position. Once the pod of the Job is read, its
+// log helper is created if needed.
 func (r *Reconciler) observeJob(ctx context.Context, crownJob *clv1alpha2.CrownJob, job *batchv1.Job) (ctrl.Result, error) {
 	workspace := strings.TrimPrefix(job.Labels[forge.KueueQueueNameLabel], forge.CrownJobQueuePrefix)
 
@@ -64,6 +65,7 @@ func (r *Reconciler) observeJob(ctx context.Context, crownJob *clv1alpha2.CrownJ
 	if ptr.Deref(job.Spec.Suspend, false) {
 		reason, message := r.waitingStatus(ctx, job, workspace)
 		setStatus(crownJob, clv1alpha2.CrownJobPhaseWaiting, reason, message)
+		crownJob.Status.QueuePosition = r.queuePosition(ctx, job, workspace)
 		return ctrl.Result{RequeueAfter: requeueWaiting}, nil
 	}
 
@@ -324,14 +326,23 @@ func (r *Reconciler) waitingStatus(ctx context.Context, job *batchv1.Job, worksp
 	return ReasonInQueue, fmt.Sprintf(msgInQueue, workspace)
 }
 
-// queueState reads, with the API reader, the state of the job queue of the given Workspace: the quotas of its
-// ClusterQueue and what its workloads reserve, and what is free in the root Cohort (its pool, plus the nominal quotas
-// of its ClusterQueues, minus their reservations). A ClusterQueue outside the root Cohort is alone with its quotas.
+// queueState returns the state of the job queue of the given Workspace: the quotas of its ClusterQueue and what its
+// workloads reserve, and what is free in the root Cohort (its pool, plus the nominal quotas of its ClusterQueues, minus
+// their reservations). A ClusterQueue outside the root Cohort is alone with its quotas. The ClusterQueues and the
+// Cohort are read with the API reader, through the cache shared by the reconciles that follow a change of the queues.
 func (r *Reconciler) queueState(ctx context.Context, workspace string) (*forge.KueueQueueState, error) {
-	queue := &unstructured.Unstructured{}
-	queue.SetGroupVersionKind(forge.KueueClusterQueueGVK)
-	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: forge.CrownJobQueueName(workspace)}, queue); err != nil {
+	snapshot, err := r.QueueCache.snapshot(ctx, r.APIReader)
+	if err != nil {
 		return nil, err
+	}
+	queue, found := snapshot.queues[forge.CrownJobQueueName(workspace)]
+	if !found {
+		// A ClusterQueue that the queue controller has not labeled yet.
+		queue = &unstructured.Unstructured{}
+		queue.SetGroupVersionKind(forge.KueueClusterQueueGVK)
+		if err := r.APIReader.Get(ctx, types.NamespacedName{Name: forge.CrownJobQueueName(workspace)}, queue); err != nil {
+			return nil, err
+		}
 	}
 	own, err := queueMemberState(queue)
 	if err != nil {
@@ -341,34 +352,44 @@ func (r *Reconciler) queueState(ctx context.Context, workspace string) (*forge.K
 	var pool []forge.KueueResourceQuota
 	members := []forge.KueueQueueState{*own}
 	if cohortName, _, _ := unstructured.NestedString(queue.Object, "spec", "cohortName"); cohortName == forge.CrownJobRootCohort {
-		cohort := &unstructured.Unstructured{}
-		cohort.SetGroupVersionKind(forge.KueueCohortGVK)
-		if err := r.APIReader.Get(ctx, types.NamespacedName{Name: forge.CrownJobRootCohort}, cohort); err != nil {
-			return nil, err
+		if snapshot.cohort == nil {
+			return nil, kerrors.NewNotFound(forge.KueueCohortGVK.GroupVersion().WithResource("cohorts").GroupResource(), forge.CrownJobRootCohort)
 		}
-		if pool, _, err = forge.KueueQuotas(cohort); err != nil {
-			return nil, err
-		}
-
-		queues := &unstructured.UnstructuredList{}
-		queues.SetGroupVersionKind(forge.KueueClusterQueueGVK.GroupVersion().WithKind(forge.KueueClusterQueueGVK.Kind + "List"))
-		if err := r.APIReader.List(ctx, queues, client.MatchingLabels{forge.LabelManagedByKey: forge.LabelManagedByCrownJobValue}); err != nil {
+		if pool, _, err = forge.KueueQuotas(snapshot.cohort); err != nil {
 			return nil, err
 		}
 		members = nil
-		for i := range queues.Items {
-			if cohortName, _, _ := unstructured.NestedString(queues.Items[i].Object, "spec", "cohortName"); cohortName != forge.CrownJobRootCohort {
+		for _, member := range snapshot.queues {
+			if cohortName, _, _ := unstructured.NestedString(member.Object, "spec", "cohortName"); cohortName != forge.CrownJobRootCohort {
 				continue
 			}
-			member, err := queueMemberState(&queues.Items[i])
+			state, err := queueMemberState(member)
 			if err != nil {
 				return nil, err
 			}
-			members = append(members, *member)
+			members = append(members, *state)
 		}
 	}
 	own.Free = forge.KueueCohortFree(pool, members)
 	return own, nil
+}
+
+// queuePosition returns the position of the given waiting Job in the queue of its Workspace, from the visibility API
+// of Kueue, starting from 1: nil if the Job is not among the waiting workloads, or if they cannot be read (logged by
+// the cache). It is shown as is, with no promise: a job that needs more than what is free can stay first while
+// smaller jobs start before it.
+func (r *Reconciler) queuePosition(ctx context.Context, job *batchv1.Job, workspace string) *int32 {
+	if r.Visibility == nil {
+		return nil
+	}
+	positions, err := r.QueueCache.positions(ctx, workspace, r.Visibility)
+	if err != nil {
+		return nil
+	}
+	if position, found := positions[job.UID]; found {
+		return &position
+	}
+	return nil
 }
 
 // queueMemberState returns the quotas of the given ClusterQueue and what its workloads reserve.
