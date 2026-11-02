@@ -39,6 +39,11 @@ func (r *Reconciler) SetupWithManagerFor(mgr ctrl.Manager, rec reconcile.Reconci
 	return r.controllerBuilder(mgr, 1).WithOptions(controller.Options{SkipNameValidation: ptr.To(true)}).Complete(rec)
 }
 
+// SetBeforeJobCreate sets the function called right before a Job is created, with the lock of the member held.
+func (r *Reconciler) SetBeforeJobCreate(f func()) {
+	r.beforeJobCreate = f
+}
+
 // Positions exposes the queue positions of a Workspace read through the cache.
 func (c *QueueCache) Positions(ctx context.Context, workspace string, reader VisibilityReader) (map[types.UID]int32, error) {
 	return c.positions(ctx, workspace, reader)

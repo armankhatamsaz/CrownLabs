@@ -30,6 +30,9 @@ const (
 	ReasonLargerThanFree = "LargerThanFree"
 	// ReasonWaitingForWindow -> the job is allowed only during a job window of the Workspace, which has not started yet.
 	ReasonWaitingForWindow = "WaitingForWindow"
+	// ReasonUserLimitReached -> the job is held, with no Job, because its member already uses their own limit in the
+	// Workspace (or an older job of theirs is held): it joins the queue when one of their jobs ends.
+	ReasonUserLimitReached = "UserLimitReached"
 	// ReasonInstanceNotReady -> the job is waiting for the Deployment of the Instance to exist.
 	ReasonInstanceNotReady = "InstanceNotReady"
 	// ReasonDiskInUse -> the job is waiting for the Instance to stop, since its disk can be used by one node at a time.
@@ -70,6 +73,10 @@ const (
 	msgLargerThanFree   = "Your job needs %s of %s at the same time, and only %s is free now: smaller jobs may start before it."
 	msgWindowRunTime    = "Your job asks for a time limit of %s, which workspace %s allows only during a job window: it will join the queue at the next one (%s)."
 	msgWindowResources  = "Your job needs %s of %s at the same time, which workspace %s allows only during a job window: it can start from the next one (%s)."
+	msgUserLimitReached = "You are already using your own limit in workspace %s (%s of %s in the queue or running): your job will join the queue when one of your jobs ends."
+	msgUserLimitOlder   = "Your job %s, sent before this one, is waiting for your own limit in workspace %s: this job will join the queue after it."
+	msgWindowPerUser    = "Your job needs %s of %s, which your own limit in workspace %s allows only during a job window: it will join the queue at the next one (%s)."
+	msgWindowPerUserEnd = "Your job needs %s of %s, which your own limit in workspace %s does not allow during this job window: it will join the queue when the window ends (%s)."
 	msgInvalidTimeZone  = "The time zone %s of the job windows is not valid: the windows are ignored, and the default limits apply."
 	msgInstanceNotReady = "The instance %s is not ready yet: the job will be created when it is."
 	msgInstanceDeleting = "The instance %s is being deleted."
@@ -109,6 +116,9 @@ const (
 	requeueDiskReleasing = 2 * time.Second
 	// requeueQueueNotReady -> how often a job waiting for the ClusterQueue of its Workspace is checked again.
 	requeueQueueNotReady = 30 * time.Second
+	// requeueHeld -> how often a job held by the per-user limit is checked again (also when one of the jobs of its
+	// member ends, and at the next start or end of a job window, if sooner).
+	requeueHeld = 30 * time.Second
 	// requeueConflict -> how soon a CrownJob or Instance is reconciled again after a conflict on its write.
 	requeueConflict = time.Second
 	// maxMessageLength -> the maximum length of a message taken from another object (e.g., the reason of a pod).

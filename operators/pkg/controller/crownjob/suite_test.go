@@ -72,6 +72,10 @@ const (
 	windowWorkspace  = "ws-win"
 	reasonWorkspaceA = "ws-ra"
 	reasonWorkspaceB = "ws-rb"
+	// perUserWorkspace lets each member use 1 cpu (2 jobs of inst-pu); perUserWindowWorkspace 500m, 1 cpu on Monday
+	// from 20:00 to 24:00 in Rome, and 250m on Tuesday from 08:00 to 12:00.
+	perUserWorkspace       = "ws-pu"
+	perUserWindowWorkspace = "ws-puwin"
 )
 
 var (
@@ -203,6 +207,18 @@ func createFixtures() {
 	// ws-ra is set by the tests that use it, so that the pool of the other tests does not depend on it.
 	create(workspace(reasonWorkspaceA, &clv1alpha1.QueueLimits{MaxAtOnce: map[string]resource.Quantity{"cpu": resource.MustParse("1")}}))
 	create(workspace(reasonWorkspaceB, &clv1alpha1.QueueLimits{MaxAtOnce: map[string]resource.Quantity{"cpu": resource.MustParse("3")}}))
+	create(workspace(perUserWorkspace, &clv1alpha1.QueueLimits{MaxAtOnce: map[string]resource.Quantity{"cpu": resource.MustParse("8")},
+		PerUser: &clv1alpha1.PerUserLimits{Resources: map[string]resource.Quantity{"cpu": resource.MustParse("1")}}}))
+	puWin := workspace(perUserWindowWorkspace, &clv1alpha1.QueueLimits{MaxAtOnce: map[string]resource.Quantity{"cpu": resource.MustParse("8")},
+		PerUser: &clv1alpha1.PerUserLimits{Resources: map[string]resource.Quantity{"cpu": resource.MustParse("500m")}}})
+	puWin.Spec.JobPolicy = &clv1alpha1.JobPolicy{TimeZone: "Europe/Rome"}
+	puWin.Spec.Windows = []clv1alpha1.JobWindow{
+		{Days: []clv1alpha1.WeekDay{clv1alpha1.WeekDayMonday}, Start: "20:00", End: "24:00", Overrides: clv1alpha1.QueueLimits{
+			PerUser: &clv1alpha1.PerUserLimits{Resources: map[string]resource.Quantity{"cpu": resource.MustParse("1")}}}},
+		{Days: []clv1alpha1.WeekDay{clv1alpha1.WeekDayTuesday}, Start: "08:00", End: "12:00", Overrides: clv1alpha1.QueueLimits{
+			PerUser: &clv1alpha1.PerUserLimits{Resources: map[string]resource.Quantity{"cpu": resource.MustParse("250m")}}}},
+	}
+	create(puWin)
 	// The ClusterQueues of the workspaces, as the queue controller creates them.
 	_, err := queueReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKey{Name: workspaceName}})
 	Expect(err).ToNot(HaveOccurred())
@@ -217,7 +233,9 @@ func createFixtures() {
 		clv1alpha2.TenantWorkspaceEntry{Name: noQueueWorkspace, Role: clv1alpha2.Manager},
 		clv1alpha2.TenantWorkspaceEntry{Name: windowWorkspace, Role: clv1alpha2.User},
 		clv1alpha2.TenantWorkspaceEntry{Name: reasonWorkspaceA, Role: clv1alpha2.User},
-		clv1alpha2.TenantWorkspaceEntry{Name: reasonWorkspaceB, Role: clv1alpha2.User}))
+		clv1alpha2.TenantWorkspaceEntry{Name: reasonWorkspaceB, Role: clv1alpha2.User},
+		clv1alpha2.TenantWorkspaceEntry{Name: perUserWorkspace, Role: clv1alpha2.User},
+		clv1alpha2.TenantWorkspaceEntry{Name: perUserWindowWorkspace, Role: clv1alpha2.User}))
 	create(tenant("candidate", clv1alpha2.TenantWorkspaceEntry{Name: workspaceName, Role: clv1alpha2.Candidate}))
 	create(tenant("prio", clv1alpha2.TenantWorkspaceEntry{Name: workspaceName, Role: clv1alpha2.User, JobPriorityClass: highPriorityClass}))
 	create(tenant("prio-missing", clv1alpha2.TenantWorkspaceEntry{Name: workspaceName, Role: clv1alpha2.User, JobPriorityClass: "ghost"}))
@@ -245,12 +263,19 @@ func createFixtures() {
 	createTemplate("tpl-ra", reasonWorkspaceA, untimed, 1, 50)
 	createTemplate("tpl-rb", reasonWorkspaceB, untimed, 1, 50)
 	createTemplate("tpl-rb-big", reasonWorkspaceB, untimed, 2, 50)
+	createTemplate("tpl-pu", perUserWorkspace, untimed, 1, 50)
+	createTemplate("tpl-pu-big", perUserWorkspace, untimed, 3, 50)
+	createTemplate("tpl-puwin", perUserWindowWorkspace, untimed, 1, 50)
+	createTemplate("tpl-puwin-2", perUserWindowWorkspace, untimed, 2, 50)
+	createTemplate("tpl-puwin-3", perUserWindowWorkspace, untimed, 3, 50)
 
 	for name, tmpl := range map[string]string{
 		"inst": "tpl", "inst-nojob": "tpl-nojob", "inst-fixed": "tpl-fixed", "inst-imagedefault": "tpl-imagedefault",
 		"inst-gpu": "tpl-gpu", "inst-amd": "tpl-amd", "inst-conflict": "tpl-conflict", "inst-bigcpu": "tpl-bigcpu",
 		"inst-noqueue": "tpl-noqueue", "inst-nows": "tpl-nows", "inst-ghostws": "tpl-ghostws", "inst-ghosttpl": "ghost",
 		"inst-win": "tpl-win", "inst-win-big": "tpl-win-big", "inst-ra": "tpl-ra", "inst-rb": "tpl-rb", "inst-rb-big": "tpl-rb-big",
+		"inst-pu": "tpl-pu", "inst-pu-big": "tpl-pu-big", "inst-puwin": "tpl-puwin", "inst-puwin-2": "tpl-puwin-2",
+		"inst-puwin-3": "tpl-puwin-3",
 	} {
 		createInstance(tenantNamespace, name, tmpl, tenantName, true)
 	}
@@ -259,6 +284,7 @@ func createFixtures() {
 	createInstance(tenantNamespace, "inst-prio-missing", "tpl", "prio-missing", true)
 	createInstance(tenantNamespace, "inst-ghosttenant", "tpl", "ghost", true)
 	createInstance(otherNamespace, "inst", "tpl", tenantName, true)
+	createInstance(otherNamespace, "inst-pu", "tpl-pu", tenantName, true)
 	createInstance(untargetedNamespace, "inst", "tpl", tenantName, true)
 }
 

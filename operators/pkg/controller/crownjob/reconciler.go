@@ -52,7 +52,8 @@ import (
 type Reconciler struct {
 	client.Client
 	// APIReader reads, without cache, the objects that the controller does not watch: the Instance and the objects
-	// it refers to (once, before the Job is created), the pod of the Job and the job queues.
+	// it refers to (once, before the Job is created), the pod of the Job and the job queues; and the Jobs of a member,
+	// counted for the per-user limit, so that the Job created by the previous count is seen.
 	APIReader      client.Reader
 	TargetLabel    ctrlcommon.KVLabel
 	EventsRecorder record.EventRecorder
@@ -77,6 +78,9 @@ type Reconciler struct {
 	// QueueCache keeps what is read about the job queues for a short time (nil: read at every reconcile).
 	QueueCache *QueueCache
 
+	// beforeJobCreate, if configured, is called right before the Job is created, with the lock of the member held.
+	beforeJobCreate func()
+
 	// This function, if configured, is deferred at the beginning of the Reconcile.
 	// Specifically, it is meant to be set to GinkgoRecover during the tests,
 	// in order to lead to a controlled failure in case the Reconcile panics.
@@ -85,9 +89,11 @@ type Reconciler struct {
 
 // SetupWithManager registers a new controller for CrownJob resources. It watches the CrownJobs and their Jobs (the main
 // Job, with the name of the CrownJob, and the log helpers), every change of the job queues (their status included:
-// the waiting jobs are reconciled again), and the metadata of the Deployments of the instances, to wake up the jobs
-// that wait for them. Pods and Workloads are read when needed, not watched, to keep the cache of the operator small.
-// The field index of the CrownJobs on their Instance is registered by InstanceReconciler.SetupWithManager.
+// the waiting jobs are reconciled again), the Jobs of the job queues that are created, end or are deleted (the jobs
+// held by the per-user limit of their member are checked again), and the metadata of the Deployments of the
+// instances, to wake up the jobs that wait for them. Pods and Workloads are read when needed, not watched, to keep
+// the cache of the operator small. The field index of the CrownJobs on their Instance is registered by
+// InstanceReconciler.SetupWithManager.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, concurrency int) error {
 	return r.controllerBuilder(mgr, concurrency).Complete(r)
 }
@@ -105,6 +111,7 @@ func (r *Reconciler) controllerBuilder(mgr ctrl.Manager, concurrency int) *build
 				return found
 			}))).
 		Watches(clusterQueue, handler.EnqueueRequestsFromMapFunc(r.waitingCrownJobs), builder.WithPredicates(isJobQueue)).
+		Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(r.heldCrownJobs), builder.WithPredicates(memberJobChanged)).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: concurrency,
 		}).
@@ -242,11 +249,16 @@ func (r *Reconciler) createJob(ctx context.Context, crownJob *clv1alpha2.CrownJo
 	}
 
 	job, err := forge.CrownJobBatchJob(crownJob, &inputs.opts)
+	var requests corev1.ResourceList
 	if err == nil {
 		// 8. Every resource the pod requests must be allowed by the queue (by the defaults or by a window), within the
 		// largest maxAtOnce and within the job capacity.
-		err = forge.CrownJobCheckQueueLimits(inputs.workspace.Name, &inputs.workspace.Spec, inputs.timeZone, r.Capacity,
-			forge.PodEffectiveRequests(&job.Spec.Template.Spec))
+		requests = forge.PodEffectiveRequests(&job.Spec.Template.Spec)
+		err = forge.CrownJobCheckQueueLimits(inputs.workspace.Name, &inputs.workspace.Spec, inputs.timeZone, r.Capacity, requests)
+	}
+	if err == nil {
+		// The per-user limit: a job above it in the defaults and in every window could never start.
+		err = forge.CrownJobCheckPerUserLimits(inputs.workspace.Name, &inputs.workspace.Spec, inputs.timeZone, requests)
 	}
 	if errors.As(err, &cannotStart) {
 		setStatus(crownJob, clv1alpha2.CrownJobPhaseFailed, ReasonCannotStart, cannotStart.Error())
@@ -262,6 +274,23 @@ func (r *Reconciler) createJob(ctx context.Context, crownJob *clv1alpha2.CrownJo
 		setStatus(crownJob, clv1alpha2.CrownJobPhaseWaiting, ReasonWaitingForWindow, fmt.Sprintf(msgWindowRunTime,
 			crownJob.Spec.MaxRunTime, inputs.workspace.Name, forge.FormatJobWindowTime(*inputs.windowStart, inputs.timeZone)))
 		return ctrl.Result{RequeueAfter: max(inputs.windowStart.Sub(r.Clock.Now()), 0) + queueRequeueMargin}, nil
+	}
+
+	// The per-user limit in force: the jobs of the member in the queue of the Workspace, waiting or running, plus this
+	// one, must fit, and the older held jobs of the member go first. The member's lock is held until the Job is created.
+	unlock := memberLocks.lock(inputs.workspace.Name + "/" + crownJob.Namespace)
+	defer unlock()
+	hold, err := r.checkPerUser(ctx, crownJob, inputs, requests)
+	switch {
+	case errors.As(err, &cannotStart):
+		setStatus(crownJob, clv1alpha2.CrownJobPhaseFailed, ReasonCannotStart, cannotStart.Error())
+		return ctrl.Result{}, nil
+	case err != nil:
+		log.Error(err, "failed checking the per-user limit")
+		return ctrl.Result{}, err
+	case hold != nil:
+		setStatus(crownJob, clv1alpha2.CrownJobPhaseWaiting, hold.reason, hold.message)
+		return ctrl.Result{RequeueAfter: hold.requeue}, nil
 	}
 
 	// The Instance is kept while the job is not terminal (see InstanceReconciler), and read again after the finalizer
@@ -291,6 +320,9 @@ func (r *Reconciler) createJob(ctx context.Context, crownJob *clv1alpha2.CrownJo
 		return ctrl.Result{}, err
 	}
 
+	if r.beforeJobCreate != nil {
+		r.beforeJobCreate()
+	}
 	if err := r.Create(ctx, job); err != nil {
 		switch {
 		case kerrors.IsAlreadyExists(err):
