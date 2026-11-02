@@ -580,34 +580,130 @@ var _ = Describe("CrownJobs forging", func() {
 	})
 
 	Describe("The forge.CrownJobCheckQueueLimits function", func() {
-		var limits clv1alpha1.QueueLimits
+		var spec clv1alpha1.WorkspaceSpec
 
 		BeforeEach(func() {
-			limits = clv1alpha1.QueueLimits{MaxAtOnce: map[string]resource.Quantity{"cpu": resource.MustParse("4"), gpu: resource.MustParse("2")}}
+			spec = clv1alpha1.WorkspaceSpec{
+				QueueLimits: &clv1alpha1.QueueLimits{MaxAtOnce: map[string]resource.Quantity{"cpu": resource.MustParse("4"), gpu: resource.MustParse("2")}},
+				Windows: []clv1alpha1.JobWindow{{Days: []clv1alpha1.WeekDay{clv1alpha1.WeekDayMonday}, Start: "20:00", End: "24:00",
+					Overrides: clv1alpha1.QueueLimits{MaxAtOnce: map[string]resource.Quantity{"cpu": resource.MustParse("6"), "amd.com/gpu": resource.MustParse("1")}}}},
+			}
 		})
 
 		It("Should accept requests within maxAtOnce, and memory that maxAtOnce does not list", func() {
-			Expect(forge.CrownJobCheckQueueLimits(workspaceName, &limits, corev1.ResourceList{
+			Expect(forge.CrownJobCheckQueueLimits(workspaceName, &spec, time.UTC, nil, corev1.ResourceList{
 				"cpu": resource.MustParse("4"), "memory": resource.MustParse("64Gi"), gpu: resource.MustParse("2"),
 			})).To(Succeed())
 		})
 
-		It("Should refuse a resource that the queue does not cover", func() {
-			expectCannotStart(forge.CrownJobCheckQueueLimits(workspaceName, &limits, corev1.ResourceList{
-				"cpu": resource.MustParse("1"), "amd.com/gpu": resource.MustParse("1"),
-			}), "The job queue of workspace ws does not allow amd.com/gpu.")
+		It("Should refuse a resource that neither the defaults nor any window allow", func() {
+			expectCannotStart(forge.CrownJobCheckQueueLimits(workspaceName, &spec, time.UTC, nil, corev1.ResourceList{
+				"cpu": resource.MustParse("1"), "example.com/fpga": resource.MustParse("1"),
+			}), "The job queue of workspace ws does not allow example.com/fpga.")
 		})
 
-		It("Should refuse a request above maxAtOnce", func() {
-			expectCannotStart(forge.CrownJobCheckQueueLimits(workspaceName, &limits, corev1.ResourceList{
-				"cpu": resource.MustParse("1"), gpu: resource.MustParse("3"),
+		It("Should refuse a request above the largest maxAtOnce of the defaults and of the windows", func() {
+			expectCannotStart(forge.CrownJobCheckQueueLimits(workspaceName, &spec, time.UTC, nil, corev1.ResourceList{
+				"cpu": resource.MustParse("7"),
+			}), "The job asks for 7 of cpu, but the job queue of workspace ws allows at most 6 at once: it could never start.")
+			// The window replaces maxAtOnce as a whole: it allows no nvidia.com/gpu, but the defaults allow 2.
+			expectCannotStart(forge.CrownJobCheckQueueLimits(workspaceName, &spec, time.UTC, nil, corev1.ResourceList{
+				gpu: resource.MustParse("3"),
 			}), "The job asks for 3 of nvidia.com/gpu, but the job queue of workspace ws allows at most 2 at once: it could never start.")
 		})
 
+		It("Should accept a request above the defaults that a window allows: it waits in the queue for the window", func() {
+			Expect(forge.CrownJobCheckQueueLimits(workspaceName, &spec, time.UTC, nil, corev1.ResourceList{
+				"cpu": resource.MustParse("6"), "amd.com/gpu": resource.MustParse("1"),
+			})).To(Succeed())
+		})
+
+		It("Should ignore the windows when the time zone is not valid (nil), since they never apply", func() {
+			expectCannotStart(forge.CrownJobCheckQueueLimits(workspaceName, &spec, nil, nil, corev1.ResourceList{
+				"cpu": resource.MustParse("6"),
+			}), "The job asks for 6 of cpu, but the job queue of workspace ws allows at most 4 at once: it could never start.")
+		})
+
+		It("Should refuse a request above the job capacity", func() {
+			capacity := corev1.ResourceList{"cpu": resource.MustParse("3"), gpu: resource.MustParse("8")}
+			expectCannotStart(forge.CrownJobCheckQueueLimits(workspaceName, &spec, time.UTC, capacity, corev1.ResourceList{
+				"cpu": resource.MustParse("4"),
+			}), "The job asks for 4 of cpu, but jobs can use at most 3 in total: it could never start.")
+			Expect(forge.CrownJobCheckQueueLimits(workspaceName, &spec, time.UTC, capacity, corev1.ResourceList{
+				"cpu": resource.MustParse("3"), "memory": resource.MustParse("1Ti"),
+			})).To(Succeed())
+		})
+
 		It("Should refuse a GPU when maxAtOnce lists none", func() {
-			expectCannotStart(forge.CrownJobCheckQueueLimits(workspaceName, &clv1alpha1.QueueLimits{}, corev1.ResourceList{
-				gpu: resource.MustParse("1"),
-			}), "The job queue of workspace ws does not allow nvidia.com/gpu.")
+			expectCannotStart(forge.CrownJobCheckQueueLimits(workspaceName, &clv1alpha1.WorkspaceSpec{QueueLimits: &clv1alpha1.QueueLimits{}},
+				time.UTC, nil, corev1.ResourceList{gpu: resource.MustParse("1")}), "The job queue of workspace ws does not allow nvidia.com/gpu.")
+		})
+	})
+
+	Describe("The forge.CrownJobMaxRunTimeAt function", func() {
+		rome, _ := time.LoadLocation("Europe/Rome")
+		monday := func(clock string) time.Time {
+			t, err := time.ParseInLocation("2006-01-02 15:04", "2026-11-02 "+clock, rome)
+			Expect(err).ToNot(HaveOccurred())
+			return t
+		}
+		var spec clv1alpha1.WorkspaceSpec
+
+		BeforeEach(func() {
+			spec = clv1alpha1.WorkspaceSpec{
+				QueueLimits: &clv1alpha1.QueueLimits{MaxRunTime: "2h"},
+				Windows: []clv1alpha1.JobWindow{{Days: []clv1alpha1.WeekDay{clv1alpha1.WeekDayMonday}, Start: "20:00", End: "24:00",
+					Overrides: clv1alpha1.QueueLimits{MaxRunTime: "6h"}}},
+			}
+		})
+
+		It("Should accept a time limit within the one in force", func() {
+			d, wait, err := forge.CrownJobMaxRunTimeAt("90m", "", &spec, rome, monday("12:00"), 2*time.Hour)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(wait).To(BeNil())
+			Expect(d).To(Equal(90 * time.Minute))
+			d, wait, err = forge.CrownJobMaxRunTimeAt("", "", &spec, rome, monday("12:00"), 2*time.Hour)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(wait).To(BeNil())
+			Expect(d).To(Equal(2 * time.Hour))
+		})
+
+		It("Should wait for the window that allows a longer time limit", func() {
+			d, wait, err := forge.CrownJobMaxRunTimeAt("6h", "", &spec, rome, monday("12:00"), 2*time.Hour)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(wait).ToNot(BeNil())
+			Expect(*wait).To(BeTemporally("==", monday("20:00")))
+			Expect(d).To(Equal(6 * time.Hour))
+		})
+
+		It("Should accept the longer time limit during the window", func() {
+			d, wait, err := forge.CrownJobMaxRunTimeAt("6h", "", &spec, rome, monday("21:00"), 2*time.Hour)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(wait).To(BeNil())
+			Expect(d).To(Equal(6 * time.Hour))
+		})
+
+		It("Should refuse a time limit that no window allows, telling the largest one", func() {
+			_, wait, err := forge.CrownJobMaxRunTimeAt("7h", "", &spec, rome, monday("12:00"), 2*time.Hour)
+			Expect(wait).To(BeNil())
+			expectCannotStart(err, "The job asks for a time limit of 7h, but at most 6h is allowed.")
+		})
+
+		It("Should keep the limit of the template, which no window raises", func() {
+			_, wait, err := forge.CrownJobMaxRunTimeAt("3h", "1h", &spec, rome, monday("12:00"), 2*time.Hour)
+			Expect(wait).To(BeNil())
+			expectCannotStart(err, "The job asks for a time limit of 3h, but at most 1h is allowed.")
+		})
+
+		It("Should ignore the windows when the time zone is not valid (nil)", func() {
+			_, wait, err := forge.CrownJobMaxRunTimeAt("6h", "", &spec, nil, monday("12:00"), 2*time.Hour)
+			Expect(wait).To(BeNil())
+			expectCannotStart(err, "The job asks for a time limit of 6h, but at most 2h is allowed.")
+		})
+
+		It("Should refuse a time limit that cannot be read", func() {
+			_, _, err := forge.CrownJobMaxRunTimeAt("30s", "", &spec, rome, monday("12:00"), 2*time.Hour)
+			expectCannotStart(err, "The time limit 30s of the job is not valid.")
 		})
 	})
 })

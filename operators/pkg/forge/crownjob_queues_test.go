@@ -181,4 +181,109 @@ var _ = Describe("Job queue quotas", func() {
 		Entry("the order is the desired one", []forge.KueueResourceQuota{q("memory", "0"), q("cpu", "1")}, []forge.KueueResourceQuota{q("cpu", "1"), q("memory", "0")},
 			[]forge.KueueResourceQuota{q("cpu", "1"), q("memory", "0")}),
 	)
+
+	Describe("The forge.KueueCohortFree function", func() {
+		It("Should add the nominal quotas of the members to the pool and subtract what they use, below zero when over-committed", func() {
+			free := forge.KueueCohortFree([]forge.KueueResourceQuota{q("cpu", "2"), q("memory", "100Ti")}, []forge.KueueQueueState{
+				{Quotas: []forge.KueueResourceQuota{q("cpu", "1", "1")}, Used: list("cpu", "3")},
+				{Quotas: []forge.KueueResourceQuota{q("cpu", "0", "4")}, Used: list("cpu", "1")},
+			})
+			Expect(free.Cpu().String()).To(Equal("-1"))
+			Expect(free.Memory().String()).To(Equal("100Ti"))
+		})
+	})
+
+	// The cases of P12a (results/p12a/DESIGN-P12.md §4), with 1 unit = 1 cpu.
+	type waitingCase struct {
+		requests corev1.ResourceList
+		state    forge.KueueQueueState
+		reason   forge.CrownJobWaiting
+		resource corev1.ResourceName
+		above    bool
+	}
+	DescribeTable("The forge.CrownJobWaitingReason function",
+		func(c waitingCase) {
+			got := forge.CrownJobWaitingReason(c.requests, &c.state)
+			Expect(got.Reason).To(Equal(c.reason))
+			Expect(got.AboveMaximum).To(Equal(c.above))
+			if c.resource != "" {
+				Expect(got.Resource).To(Equal(c.resource))
+			}
+		},
+		Entry("E1b: own maximum reached with units free (a uses 4 of its maximum 4, 2 free)", waitingCase{
+			requests: list("cpu", "1"),
+			state:    forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "0", "4")}, Used: list("cpu", "4"), Free: list("cpu", "2")},
+			reason:   forge.CrownJobWaitingQuotaReached, resource: "cpu"}),
+		Entry("E2: guarantee lent and in use (a guaranteed 2 uses 0, nothing free)", waitingCase{
+			requests: list("cpu", "1"),
+			state:    forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "2", "4")}, Used: list("cpu", "0"), Free: list("cpu", "0")},
+			reason:   forge.CrownJobWaitingGuaranteeInUse}),
+		Entry("E2: the guarantee covers a second job too (uses 1 of 2)", waitingCase{
+			requests: list("cpu", "1"),
+			state:    forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "2", "4")}, Used: list("cpu", "1"), Free: list("cpu", "0")},
+			reason:   forge.CrownJobWaitingGuaranteeInUse}),
+		Entry("a 2-unit job that its guarantee does not cover (1 of 2 used), nothing free", waitingCase{
+			requests: list("cpu", "2"),
+			state:    forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "2", "4")}, Used: list("cpu", "1"), Free: list("cpu", "0")},
+			reason:   forge.CrownJobWaitingCapacityReached}),
+		Entry("E1: the pool used up (no guarantee, nothing free)", waitingCase{
+			requests: list("cpu", "1"),
+			state:    forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "0", "6")}, Used: list("cpu", "3"), Free: list("cpu", "0")},
+			reason:   forge.CrownJobWaitingCapacityReached}),
+		Entry("E2: the guarantee in use beyond it (uses 2 of 2, the next job borrows)", waitingCase{
+			requests: list("cpu", "1"),
+			state:    forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "2", "4")}, Used: list("cpu", "2"), Free: list("cpu", "0")},
+			reason:   forge.CrownJobWaitingCapacityReached}),
+		Entry("E3b: over-committed (6 on 4) reads as capacity reached", waitingCase{
+			requests: list("cpu", "1"),
+			state:    forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "0", "6")}, Used: list("cpu", "2"), Free: list("cpu", "-2")},
+			reason:   forge.CrownJobWaitingCapacityReached}),
+		Entry("E5: a 2-unit job with nothing free", waitingCase{
+			requests: list("cpu", "2"),
+			state:    forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "0", "6")}, Used: list("cpu", "3"), Free: list("cpu", "0")},
+			reason:   forge.CrownJobWaitingCapacityReached}),
+		Entry("E5b: a 2-unit job with 1 unit free", waitingCase{
+			requests: list("cpu", "2"),
+			state:    forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "0", "6")}, Used: list("cpu", "3"), Free: list("cpu", "1")},
+			reason:   forge.CrownJobWaitingLargerThanFree}),
+		Entry("a job that fits waits for its turn", waitingCase{
+			requests: list("cpu", "1"),
+			state:    forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "0", "6")}, Used: list("cpu", "3"), Free: list("cpu", "1")},
+			reason:   forge.CrownJobWaitingInQueue}),
+		Entry("Q6: a job alone above the maximum in force (3 on 0 + 2)", waitingCase{
+			requests: list("cpu", "3"),
+			state:    forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "0", "2")}, Free: list("cpu", "3")},
+			reason:   forge.CrownJobWaitingQuotaReached, above: true}),
+		Entry("an unlimited maximum is never reached", waitingCase{
+			requests: list("memory", "64Gi"),
+			state:    forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("memory", "0")}, Used: list("memory", "1Ti"), Free: list("memory", "100Ti")},
+			reason:   forge.CrownJobWaitingInQueue}),
+		Entry("the first reason by rank wins over the resource order (cpu LargerThanFree, gpu QuotaReached)", waitingCase{
+			requests: list("cpu", "2", gpu, "1"),
+			state: forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "0", "4"), q(gpu, "0", "1")},
+				Used: list(gpu, "1"), Free: list("cpu", "1", gpu, "1")},
+			reason: forge.CrownJobWaitingQuotaReached, resource: gpu}),
+		Entry("among equal reasons, the first resource by name", waitingCase{
+			requests: list("memory", "2Gi", "cpu", "2"),
+			state: forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "0", "4"), q("memory", "0", "4Gi")},
+				Free: list("cpu", "1", "memory", "1Gi")},
+			reason: forge.CrownJobWaitingLargerThanFree, resource: "cpu"}),
+		Entry("a resource the queue does not cover is its maximum reached", waitingCase{
+			requests: list("example.com/fpga", "1"),
+			state:    forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "0", "4")}, Free: list("cpu", "4")},
+			reason:   forge.CrownJobWaitingQuotaReached, above: true}),
+		Entry("a zero request is ignored, even of a resource used above its maximum", waitingCase{
+			requests: list("cpu", "1", gpu, "0"),
+			state: forge.KueueQueueState{Quotas: []forge.KueueResourceQuota{q("cpu", "0", "4"), q(gpu, "0", "0")},
+				Used: list(gpu, "1"), Free: list("cpu", "4")},
+			reason: forge.CrownJobWaitingInQueue}),
+	)
+
+	It("Should report the numbers of LargerThanFree", func() {
+		got := forge.CrownJobWaitingReason(list("cpu", "1"), &forge.KueueQueueState{
+			Quotas: []forge.KueueResourceQuota{q("cpu", "0", "3")}, Free: list("cpu", "500m")})
+		Expect(got.Reason).To(Equal(forge.CrownJobWaitingLargerThanFree))
+		Expect(got.Requested.String()).To(Equal("1"))
+		Expect(got.Free.String()).To(Equal("500m"))
+	})
 })

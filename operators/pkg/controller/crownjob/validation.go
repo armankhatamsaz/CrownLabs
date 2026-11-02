@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -52,6 +53,10 @@ type jobInputs struct {
 	instance  *clv1alpha2.Instance
 	workspace *clv1alpha1.Workspace
 	opts      forge.CrownJobJobOpts
+	// timeZone is the time zone of the job windows of the Workspace (nil if not valid: the windows are ignored).
+	timeZone *time.Location
+	// windowStart is set when the time limit of the job is allowed only from a later job window: its start.
+	windowStart *time.Time
 }
 
 // gatherJobInputs reads the objects a CrownJob refers to, and checks the rules a job must respect before its Job
@@ -127,8 +132,14 @@ func (r *Reconciler) gatherJobInputs(ctx context.Context, crownJob *clv1alpha2.C
 		return nil, err
 	}
 
-	// 7. The maximum run time.
-	maxRunTime, err := forge.CrownJobMaxRunTime(crownJob.Spec.MaxRunTime, templateJob.MaxRunTime, workspace.Spec.QueueLimits.MaxRunTime, r.DefaultMaxRunTime)
+	// 7. The maximum run time, against the limits of the Workspace in force now. One that only a later job window
+	// allows is not terminal: the job waits for the window (once the other rules pass, see createJob).
+	timeZone, err := forge.JobTimeZone(workspace.Spec.JobPolicy, r.DefaultTimeZone)
+	if err != nil {
+		timeZone = nil
+	}
+	maxRunTime, windowStart, err := forge.CrownJobMaxRunTimeAt(crownJob.Spec.MaxRunTime, templateJob.MaxRunTime, &workspace.Spec,
+		timeZone, r.Clock.Now(), r.DefaultMaxRunTime)
 	if err != nil {
 		return nil, err
 	}
@@ -172,8 +183,10 @@ func (r *Reconciler) gatherJobInputs(ctx context.Context, crownJob *clv1alpha2.C
 
 	// Rule 8 (resources) is checked on the forged Job, by the caller: it needs the pod template of the Deployment.
 	return &jobInputs{
-		instance:  &instance,
-		workspace: &workspace,
+		instance:    &instance,
+		workspace:   &workspace,
+		timeZone:    timeZone,
+		windowStart: windowStart,
 		opts: forge.CrownJobJobOpts{
 			Workspace:       workspaceName,
 			EnvironmentName: environment.Name,

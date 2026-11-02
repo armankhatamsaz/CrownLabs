@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
 	"k8s.io/utils/trace"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -63,6 +64,13 @@ type Reconciler struct {
 	// FinishedJobTTL is how long a Job (the main Job, or a log helper) is kept after it ends, with its pods: then they
 	// no longer keep the disk of the instance in use. The CrownJob is kept, with its terminal status.
 	FinishedJobTTL time.Duration
+	// Capacity is the job capacity: the most all the jobs may use at the same time, by resource (empty: unlimited).
+	// A job asking for more of a resource could never start.
+	Capacity corev1.ResourceList
+	// DefaultTimeZone is the time zone of the job windows of the Workspaces whose jobPolicy sets none.
+	DefaultTimeZone *time.Location
+	// Clock returns the current time: the limits of a Workspace in force depend on it.
+	Clock clock.PassiveClock
 
 	// This function, if configured, is deferred at the beginning of the Reconcile.
 	// Specifically, it is meant to be set to GinkgoRecover during the tests,
@@ -222,8 +230,9 @@ func (r *Reconciler) createJob(ctx context.Context, crownJob *clv1alpha2.CrownJo
 
 	job, err := forge.CrownJobBatchJob(crownJob, &inputs.opts)
 	if err == nil {
-		// 8. Every resource the pod requests must be covered by the queue, within maxAtOnce.
-		err = forge.CrownJobCheckQueueLimits(inputs.workspace.Name, inputs.workspace.Spec.QueueLimits,
+		// 8. Every resource the pod requests must be allowed by the queue (by the defaults or by a window), within the
+		// largest maxAtOnce and within the job capacity.
+		err = forge.CrownJobCheckQueueLimits(inputs.workspace.Name, &inputs.workspace.Spec, inputs.timeZone, r.Capacity,
 			forge.PodEffectiveRequests(&job.Spec.Template.Spec))
 	}
 	if errors.As(err, &cannotStart) {
@@ -232,6 +241,14 @@ func (r *Reconciler) createJob(ctx context.Context, crownJob *clv1alpha2.CrownJo
 	} else if err != nil {
 		log.Error(err, "failed forging the job")
 		return ctrl.Result{}, err
+	}
+
+	// 7, continued: a time limit that only a later job window allows. The Job is created at the start of the window,
+	// and keeps its time limit even if it starts after the window.
+	if inputs.windowStart != nil {
+		setStatus(crownJob, clv1alpha2.CrownJobPhaseWaiting, ReasonWaitingForWindow, fmt.Sprintf(msgWindowRunTime,
+			crownJob.Spec.MaxRunTime, inputs.workspace.Name, forge.FormatJobWindowTime(*inputs.windowStart, inputs.timeZone)))
+		return ctrl.Result{RequeueAfter: max(inputs.windowStart.Sub(r.Clock.Now()), 0) + queueRequeueMargin}, nil
 	}
 
 	// The Instance is kept while the job is not terminal (see InstanceReconciler), and read again after the finalizer

@@ -66,6 +66,11 @@ const (
 	highPriorityClass   = "p-high"
 	logHelperImage      = "registry.k8s.io/kubectl:v1.34.1"
 	finishedJobTTL      = 10 * time.Minute
+	// windowWorkspace has a job window on Monday from 20:00 to 24:00 in Rome; reasonWorkspaceA and reasonWorkspaceB
+	// are used to write the state of their queues as Kueue would.
+	windowWorkspace  = "ws-win"
+	reasonWorkspaceA = "ws-ra"
+	reasonWorkspaceB = "ws-rb"
 )
 
 var (
@@ -125,6 +130,8 @@ var _ = BeforeSuite(func() {
 		DefaultMaxRunTime:  2 * time.Hour,
 		LogHelperImage:     logHelperImage,
 		FinishedJobTTL:     finishedJobTTL,
+		DefaultTimeZone:    time.UTC,
+		Clock:              testClock,
 		ReconcileDeferHook: GinkgoRecover,
 	}
 	queueReconciler = crownjob.QueueReconciler{
@@ -182,7 +189,18 @@ func createFixtures() {
 		MaxRunTime: "6h",
 	}))
 	create(workspace(noQueueWorkspace, nil))
-	// The ClusterQueue of the workspace, as the queue controller creates it.
+	win := workspace(windowWorkspace, &clv1alpha1.QueueLimits{
+		MaxAtOnce: map[string]resource.Quantity{"cpu": resource.MustParse("4")}, MaxRunTime: "2h",
+	})
+	win.Spec.JobPolicy = &clv1alpha1.JobPolicy{TimeZone: "Europe/Rome"}
+	win.Spec.Windows = []clv1alpha1.JobWindow{{Days: []clv1alpha1.WeekDay{clv1alpha1.WeekDayMonday}, Start: "20:00", End: "24:00",
+		Overrides: clv1alpha1.QueueLimits{MaxAtOnce: map[string]resource.Quantity{"cpu": resource.MustParse("8")}, MaxRunTime: "6h"}}}
+	create(win)
+	// A unit is the cpu request of the tpl-r* templates (500m): ws-ra may use 2 at once, ws-rb 6. The guarantee of
+	// ws-ra is set by the tests that use it, so that the pool of the other tests does not depend on it.
+	create(workspace(reasonWorkspaceA, &clv1alpha1.QueueLimits{MaxAtOnce: map[string]resource.Quantity{"cpu": resource.MustParse("1")}}))
+	create(workspace(reasonWorkspaceB, &clv1alpha1.QueueLimits{MaxAtOnce: map[string]resource.Quantity{"cpu": resource.MustParse("3")}}))
+	// The ClusterQueues of the workspaces, as the queue controller creates them.
 	_, err := queueReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKey{Name: workspaceName}})
 	Expect(err).ToNot(HaveOccurred())
 
@@ -193,7 +211,10 @@ func createFixtures() {
 	create(wpc)
 
 	create(tenant(tenantName, clv1alpha2.TenantWorkspaceEntry{Name: workspaceName, Role: clv1alpha2.User},
-		clv1alpha2.TenantWorkspaceEntry{Name: noQueueWorkspace, Role: clv1alpha2.Manager}))
+		clv1alpha2.TenantWorkspaceEntry{Name: noQueueWorkspace, Role: clv1alpha2.Manager},
+		clv1alpha2.TenantWorkspaceEntry{Name: windowWorkspace, Role: clv1alpha2.User},
+		clv1alpha2.TenantWorkspaceEntry{Name: reasonWorkspaceA, Role: clv1alpha2.User},
+		clv1alpha2.TenantWorkspaceEntry{Name: reasonWorkspaceB, Role: clv1alpha2.User}))
 	create(tenant("candidate", clv1alpha2.TenantWorkspaceEntry{Name: workspaceName, Role: clv1alpha2.Candidate}))
 	create(tenant("prio", clv1alpha2.TenantWorkspaceEntry{Name: workspaceName, Role: clv1alpha2.User, JobPriorityClass: highPriorityClass}))
 	create(tenant("prio-missing", clv1alpha2.TenantWorkspaceEntry{Name: workspaceName, Role: clv1alpha2.User, JobPriorityClass: "ghost"}))
@@ -215,11 +236,18 @@ func createFixtures() {
 	createTemplate("tpl-noqueue", noQueueWorkspace, editable, 1, 50)
 	createTemplate("tpl-nows", "", editable, 1, 50)
 	createTemplate("tpl-ghostws", "ghost", editable, 1, 50)
+	untimed := &clv1alpha2.TemplateJob{EnvironmentName: envName, CommandPolicy: clv1alpha2.JobCommandEditable}
+	createTemplate("tpl-win", windowWorkspace, untimed, 1, 50)
+	createTemplate("tpl-win-big", windowWorkspace, untimed, 8, 100)
+	createTemplate("tpl-ra", reasonWorkspaceA, untimed, 1, 50)
+	createTemplate("tpl-rb", reasonWorkspaceB, untimed, 1, 50)
+	createTemplate("tpl-rb-big", reasonWorkspaceB, untimed, 2, 50)
 
 	for name, tmpl := range map[string]string{
 		"inst": "tpl", "inst-nojob": "tpl-nojob", "inst-fixed": "tpl-fixed", "inst-imagedefault": "tpl-imagedefault",
 		"inst-gpu": "tpl-gpu", "inst-amd": "tpl-amd", "inst-conflict": "tpl-conflict", "inst-bigcpu": "tpl-bigcpu",
 		"inst-noqueue": "tpl-noqueue", "inst-nows": "tpl-nows", "inst-ghostws": "tpl-ghostws", "inst-ghosttpl": "ghost",
+		"inst-win": "tpl-win", "inst-win-big": "tpl-win-big", "inst-ra": "tpl-ra", "inst-rb": "tpl-rb", "inst-rb-big": "tpl-rb-big",
 	} {
 		createInstance(tenantNamespace, name, tmpl, tenantName, true)
 	}

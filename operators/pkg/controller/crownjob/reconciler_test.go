@@ -390,7 +390,8 @@ var _ = Describe("The CrownJob controller", func() {
 			Expect(localQueue.GetOwnerReferences()[0].Kind).To(Equal("Workspace"))
 			Expect(localQueue.GetOwnerReferences()[0].Name).To(Equal(workspaceName))
 
-			// The Workload kind is not installed in envtest (the read fails with NoMatch): the job stays InQueue, without errors.
+			// The Workload kind is not installed in envtest, and the waiting reason is computed from the queue alone (no
+			// Workload is read): the job stays InQueue, without errors.
 			workloads := &unstructured.UnstructuredList{}
 			workloads.SetGroupVersionKind(forge.KueueWorkloadGVK.GroupVersion().WithKind("WorkloadList"))
 			Expect(meta.IsNoMatchError(k8sClient.List(ctx, workloads, client.InNamespace(tenantNamespace)))).To(BeTrue())

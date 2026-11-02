@@ -16,7 +16,6 @@ package forge
 
 import (
 	"fmt"
-	"sort"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -40,11 +39,6 @@ const (
 	KueueQueueNameLabel = "kueue.x-k8s.io/queue-name"
 	// KueuePriorityClassLabel -> the label of a Job naming its WorkloadPriorityClass.
 	KueuePriorityClassLabel = "kueue.x-k8s.io/priority-class"
-	// KueueJobUIDLabel -> the label set by Kueue on a Workload, with the UID of its Job.
-	KueueJobUIDLabel = "kueue.x-k8s.io/job-uid"
-
-	// KueueConditionQuotaReserved -> the Workload condition telling whether quota is reserved in a ClusterQueue.
-	KueueConditionQuotaReserved = "QuotaReserved"
 
 	// CrownJobFieldManager -> the field manager used to apply the Kueue objects.
 	CrownJobFieldManager = "crownlabs-crownjob"
@@ -85,49 +79,9 @@ var (
 	KueueNoLimitMemory = resource.MustParse("100Ti")
 )
 
-// KueueQueueQuota is the nominal quota of one resource in the job queue of a Workspace.
-type KueueQueueQuota struct {
-	Name  corev1.ResourceName
-	Quota resource.Quantity
-}
-
 // CrownJobQueueName returns the name of the ClusterQueue and of the LocalQueues of the given Workspace.
 func CrownJobQueueName(workspace string) string {
 	return CrownJobQueuePrefix + workspace
-}
-
-// KueueQueueQuotas returns the resources covered by a job queue with the given limits, with their nominal quota:
-// cpu and memory first (always covered, see KueueNoLimitCPU), then the other keys of maxAtOnce, sorted.
-func KueueQueueQuotas(limits *clv1alpha1.QueueLimits) []KueueQueueQuota {
-	var maxAtOnce map[string]resource.Quantity
-	if limits != nil {
-		maxAtOnce = limits.MaxAtOnce
-	}
-
-	quotaOrDefault := func(name corev1.ResourceName, def resource.Quantity) resource.Quantity {
-		if quota, found := maxAtOnce[name.String()]; found {
-			return quota.DeepCopy()
-		}
-		return def.DeepCopy()
-	}
-
-	quotas := []KueueQueueQuota{
-		{Name: corev1.ResourceCPU, Quota: quotaOrDefault(corev1.ResourceCPU, KueueNoLimitCPU)},
-		{Name: corev1.ResourceMemory, Quota: quotaOrDefault(corev1.ResourceMemory, KueueNoLimitMemory)},
-	}
-
-	others := make([]string, 0, len(maxAtOnce))
-	for name := range maxAtOnce {
-		if name != corev1.ResourceCPU.String() && name != corev1.ResourceMemory.String() {
-			others = append(others, name)
-		}
-	}
-	sort.Strings(others)
-	for _, name := range others {
-		quotas = append(quotas, KueueQueueQuota{Name: corev1.ResourceName(name), Quota: maxAtOnce[name].DeepCopy()})
-	}
-
-	return quotas
 }
 
 // KueueResourceFlavor forges the ResourceFlavor used by every job queue (with an empty spec).

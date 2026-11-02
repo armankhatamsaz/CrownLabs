@@ -20,8 +20,16 @@ import "time"
 const (
 	// ReasonInQueue -> the job is waiting in the queue of the Workspace.
 	ReasonInQueue = "InQueue"
-	// ReasonQuotaReached -> the job is waiting because the queue of the Workspace is using all its resources.
+	// ReasonQuotaReached -> the job is waiting because the Workspace uses everything its jobs may use at the same time.
 	ReasonQuotaReached = "QuotaReached"
+	// ReasonGuaranteeInUse -> the job fits in the guarantee of the Workspace, which other Workspaces are using.
+	ReasonGuaranteeInUse = "GuaranteeInUse"
+	// ReasonCapacityReached -> the job is waiting because every resource for jobs is in use.
+	ReasonCapacityReached = "CapacityReached"
+	// ReasonLargerThanFree -> the job needs more than what is free now: smaller jobs may start before it.
+	ReasonLargerThanFree = "LargerThanFree"
+	// ReasonWaitingForWindow -> the job is allowed only during a job window of the Workspace, which has not started yet.
+	ReasonWaitingForWindow = "WaitingForWindow"
 	// ReasonInstanceNotReady -> the job is waiting for the Deployment of the Instance to exist.
 	ReasonInstanceNotReady = "InstanceNotReady"
 	// ReasonDiskInUse -> the job is waiting for the Instance to stop, since its disk can be used by one node at a time.
@@ -56,7 +64,13 @@ const (
 // The messages of the status of a CrownJob: plain sentences, for a student.
 const (
 	msgInQueue          = "Your job is waiting in the queue of workspace %s."
-	msgQuotaReached     = "The workspace is using all the resources its job queue allows: your job will start when some are free."
+	msgQuotaReached     = "Workspace %s is already using everything its jobs may use at the same time: your job will start when one of its jobs ends."
+	msgGuaranteeInUse   = "Other workspaces are using the share reserved for workspace %s: your job will start as soon as one of their jobs ends. No job is stopped."
+	msgCapacityReached  = "All the resources for jobs are in use: your job will start when another job ends."
+	msgLargerThanFree   = "Your job needs %s of %s at the same time, and only %s is free now: smaller jobs may start before it."
+	msgWindowRunTime    = "Your job asks for a time limit of %s, which workspace %s allows only during a job window: it will join the queue at the next one (%s)."
+	msgWindowResources  = "Your job needs %s of %s at the same time, which workspace %s allows only during a job window: it can start from the next one (%s)."
+	msgInvalidTimeZone  = "The time zone %s of the job windows is not valid: the windows are ignored, and the default limits apply."
 	msgInstanceNotReady = "The instance %s is not ready yet: the job will be created when it is."
 	msgInstanceDeleting = "The instance %s is being deleted."
 	msgInstanceGone     = "The instance %s does not exist."
@@ -80,7 +94,6 @@ const (
 	msgJobDeleted       = "The job was deleted before it ended."
 	msgJobNameTaken     = "Another job named %s already exists in this namespace."
 	msgJobInvalid       = "The job could not be created: %s."
-	msgInvalidTimeZone  = "The time zone %s of the job windows is not valid: the windows are ignored, and the default limits apply."
 )
 
 const (
@@ -115,7 +128,4 @@ const (
 	eventReasonBackOff = "BackOff"
 	// eventInvolvedObjectUIDField -> the field selector of the events about a given object.
 	eventInvolvedObjectUIDField = "involvedObject.uid"
-	// kueueInsufficientQuota -> the text of the message of the QuotaReserved condition of a Workload when the
-	// ClusterQueue does not have enough unused quota for it (e.g., "insufficient unused quota for cpu in flavor ...").
-	kueueInsufficientQuota = "insufficient"
 )

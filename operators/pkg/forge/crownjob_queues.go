@@ -223,6 +223,127 @@ func KueueQueuePlanFor(workspaces []KueueWorkspaceLimits, capacity corev1.Resour
 	return plan
 }
 
+// CrownJobWaiting tells why a job waits in the queue of its Workspace. The values are in the order in which the
+// rules are checked: the first one that any requested resource gives is the reason of the job.
+type CrownJobWaiting int
+
+const (
+	// CrownJobWaitingQuotaReached -> the Workspace uses so much that the job would take it above its maximum.
+	CrownJobWaitingQuotaReached CrownJobWaiting = iota
+	// CrownJobWaitingGuaranteeInUse -> the job fits in the guarantee of the Workspace, which other Workspaces are using.
+	CrownJobWaitingGuaranteeInUse
+	// CrownJobWaitingCapacityReached -> nothing is free in the shared pool.
+	CrownJobWaitingCapacityReached
+	// CrownJobWaitingLargerThanFree -> something is free, but less than the job needs.
+	CrownJobWaitingLargerThanFree
+	// CrownJobWaitingInQueue -> the job fits: it waits for its turn.
+	CrownJobWaitingInQueue
+)
+
+// KueueQueueState is what the waiting reason of a job is computed from: the quotas of the ClusterQueue of its
+// Workspace (nominal n, borrowing limit b), what that ClusterQueue uses (u, its reservation), and what is free in the
+// root Cohort (the pool, plus the nominal quotas of its ClusterQueues, minus what they use).
+type KueueQueueState struct {
+	Quotas []KueueResourceQuota
+	Used   corev1.ResourceList
+	Free   corev1.ResourceList
+}
+
+// CrownJobWaitingResult is the waiting reason of a job, with the resource that gave it and the numbers to show.
+type CrownJobWaitingResult struct {
+	Reason    CrownJobWaiting
+	Resource  corev1.ResourceName
+	Requested resource.Quantity
+	Free      resource.Quantity
+	// AboveMaximum tells, for CrownJobWaitingQuotaReached, that the job alone is above the maximum in force (q > n + b):
+	// it can start only when the limits change (e.g., in a job window).
+	AboveMaximum bool
+}
+
+// KueueCohortFree returns what is free in the root Cohort, by resource: its pool, plus the nominal quotas of its
+// ClusterQueues, minus what they use. It can be negative, when the quotas were lowered below what running jobs use.
+func KueueCohortFree(pool []KueueResourceQuota, members []KueueQueueState) corev1.ResourceList {
+	free := corev1.ResourceList{}
+	for i := range pool {
+		free[pool[i].Name] = pool[i].Nominal.DeepCopy()
+	}
+	for i := range members {
+		for j := range members[i].Quotas {
+			sum := free[members[i].Quotas[j].Name]
+			sum.Add(members[i].Quotas[j].Nominal)
+			free[members[i].Quotas[j].Name] = sum
+		}
+		for name, used := range members[i].Used {
+			sum := free[name]
+			sum.Sub(used)
+			free[name] = sum
+		}
+	}
+	return free
+}
+
+// CrownJobWaitingReason returns why a job with the given requests waits in the queue of its Workspace, from the state
+// of the queue alone (Kueue gives one message for several causes, and no condition at all to identical waiting jobs).
+// For each requested resource (q > 0), with u, n, b and free as in KueueQueueState (b unset: no limit):
+//  1. u + q > n + b -> QuotaReached;
+//  2. else, if free < q and u + q <= n -> GuaranteeInUse;
+//  3. else, if free < q and free <= 0 -> CapacityReached;
+//  4. else, if free < q -> LargerThanFree;
+//  5. else -> InQueue.
+//
+// The reason of the job is the first of 1-5 that any resource gives (the first resource by name, among equals).
+func CrownJobWaitingReason(requests corev1.ResourceList, state *KueueQueueState) CrownJobWaitingResult {
+	quotas := map[corev1.ResourceName]KueueResourceQuota{}
+	for i := range state.Quotas {
+		quotas[state.Quotas[i].Name] = state.Quotas[i]
+	}
+	names := make([]string, 0, len(requests))
+	for name := range requests {
+		names = append(names, name.String())
+	}
+	sort.Strings(names)
+
+	result := CrownJobWaitingResult{Reason: CrownJobWaitingInQueue}
+	for _, name := range names {
+		resourceName := corev1.ResourceName(name)
+		requested := requests[resourceName]
+		if requested.Sign() <= 0 {
+			continue
+		}
+		quota, covered := quotas[resourceName]
+		if !covered {
+			quota = KueueResourceQuota{Name: resourceName, BorrowingLimit: ptrQuantity(resource.Quantity{})}
+		}
+		used, free := state.Used[resourceName], state.Free[resourceName]
+		after := used.DeepCopy()
+		after.Add(requested)
+
+		current := CrownJobWaitingResult{Reason: CrownJobWaitingInQueue, Resource: resourceName, Requested: requested.DeepCopy(), Free: free.DeepCopy()}
+		switch {
+		case quota.BorrowingLimit != nil && after.Cmp(sum(quota.Nominal, *quota.BorrowingLimit)) > 0:
+			current.Reason = CrownJobWaitingQuotaReached
+			current.AboveMaximum = requested.Cmp(sum(quota.Nominal, *quota.BorrowingLimit)) > 0
+		case free.Cmp(requested) < 0 && after.Cmp(quota.Nominal) <= 0:
+			current.Reason = CrownJobWaitingGuaranteeInUse
+		case free.Cmp(requested) < 0 && free.Sign() <= 0:
+			current.Reason = CrownJobWaitingCapacityReached
+		case free.Cmp(requested) < 0:
+			current.Reason = CrownJobWaitingLargerThanFree
+		}
+		if current.Reason < result.Reason {
+			result = current
+		}
+	}
+	return result
+}
+
+// sum returns the sum of two quantities.
+func sum(a, b resource.Quantity) resource.Quantity {
+	total := a.DeepCopy()
+	total.Add(b)
+	return total
+}
+
 // KueuePhase1 returns the quotas to apply first when the current quotas of a ClusterQueue or of the root Cohort change
 // to the desired ones: for each desired resource, the smallest of the current and desired nominal quotas, and the same
 // for the borrowing limits, where an unset one counts as no limit. A resource with no current quota counts as 0 for

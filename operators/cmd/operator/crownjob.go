@@ -101,6 +101,9 @@ func setupCrownJob(mgr manager.Manager, targetLabel ctrlcommon.KVLabel) error {
 		DefaultMaxRunTime: defaultMaxRunTime,
 		LogHelperImage:    crownJobLogHelperImage,
 		FinishedJobTTL:    finishedJobTTL,
+		Capacity:          capacity,
+		DefaultTimeZone:   timeZone,
+		Clock:             clock.RealClock{},
 	}).SetupWithManager(mgr, maxConcurrentCrownJobReconciles); err != nil {
 		return err
 	}

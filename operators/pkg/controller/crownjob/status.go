@@ -22,13 +22,16 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	clv1alpha1 "github.com/netgroup-polito/CrownLabs/operators/api/v1alpha1"
 	clv1alpha2 "github.com/netgroup-polito/CrownLabs/operators/api/v1alpha2"
 	"github.com/netgroup-polito/CrownLabs/operators/pkg/forge"
 	"github.com/netgroup-polito/CrownLabs/operators/pkg/utils"
@@ -59,10 +62,7 @@ func (r *Reconciler) observeJob(ctx context.Context, crownJob *clv1alpha2.CrownJ
 	}
 
 	if ptr.Deref(job.Spec.Suspend, false) {
-		reason, message := ReasonInQueue, fmt.Sprintf(msgInQueue, workspace)
-		if r.quotaReached(ctx, job) {
-			reason, message = ReasonQuotaReached, msgQuotaReached
-		}
+		reason, message := r.waitingStatus(ctx, job, workspace)
 		setStatus(crownJob, clv1alpha2.CrownJobPhaseWaiting, reason, message)
 		return ctrl.Result{RequeueAfter: requeueWaiting}, nil
 	}
@@ -288,34 +288,122 @@ func eventTime(event *corev1.Event) time.Time {
 	}
 }
 
-// quotaReached returns whether the Kueue Workload of the given Job is waiting because its ClusterQueue does not
-// have enough unused quota. A missing Workload kind (e.g., in tests) or a read error count as "no".
-func (r *Reconciler) quotaReached(ctx context.Context, job *batchv1.Job) bool {
-	workloads := &unstructured.UnstructuredList{}
-	workloads.SetGroupVersionKind(forge.KueueWorkloadGVK.GroupVersion().WithKind(forge.KueueWorkloadGVK.Kind + "List"))
-	if err := r.APIReader.List(ctx, workloads, client.InNamespace(job.Namespace),
-		client.MatchingLabels{forge.KueueJobUIDLabel: string(job.UID)}); err != nil {
-		if !meta.IsNoMatchError(err) {
-			ctrl.LoggerFrom(ctx).Error(err, "failed retrieving the workload of the job")
+// waitingStatus returns the reason and the message of a Job waiting in the queue of its Workspace, computed from the
+// state of the queue: its ClusterQueue (quotas and reservation), the other ClusterQueues of the root Cohort and the
+// Cohort (see forge.CrownJobWaitingReason). Kueue's own message is the same for several causes, and Kueue writes no
+// condition at all on identical waiting Workloads, so it is not read. A missing object or a read error -> InQueue.
+func (r *Reconciler) waitingStatus(ctx context.Context, job *batchv1.Job, workspace string) (reason, message string) {
+	log := ctrl.LoggerFrom(ctx)
+	state, err := r.queueState(ctx, workspace)
+	if err != nil {
+		if !meta.IsNoMatchError(err) && !kerrors.IsNotFound(err) {
+			log.Error(err, "failed reading the state of the job queue")
 		}
-		return false
+		return ReasonInQueue, fmt.Sprintf(msgInQueue, workspace)
 	}
 
-	for i := range workloads.Items {
-		if !metav1.IsControlledBy(&workloads.Items[i], job) {
-			continue
+	requests := forge.PodEffectiveRequests(&job.Spec.Template.Spec)
+	result := forge.CrownJobWaitingReason(requests, state)
+	switch result.Reason {
+	case forge.CrownJobWaitingQuotaReached:
+		if result.AboveMaximum {
+			if start, loc, found := r.nextWindowAllowing(ctx, workspace, requests); found {
+				return ReasonWaitingForWindow, fmt.Sprintf(msgWindowResources, result.Requested.String(), result.Resource,
+					workspace, forge.FormatJobWindowTime(start, loc))
+			}
 		}
-		conditions, _, _ := unstructured.NestedSlice(workloads.Items[i].Object, "status", "conditions")
-		for _, c := range conditions {
-			condition, ok := c.(map[string]interface{})
-			if !ok || condition["type"] != forge.KueueConditionQuotaReserved || condition["status"] != string(metav1.ConditionFalse) {
+		return ReasonQuotaReached, fmt.Sprintf(msgQuotaReached, workspace)
+	case forge.CrownJobWaitingGuaranteeInUse:
+		return ReasonGuaranteeInUse, fmt.Sprintf(msgGuaranteeInUse, workspace)
+	case forge.CrownJobWaitingCapacityReached:
+		return ReasonCapacityReached, msgCapacityReached
+	case forge.CrownJobWaitingLargerThanFree:
+		return ReasonLargerThanFree, fmt.Sprintf(msgLargerThanFree, result.Requested.String(), result.Resource, result.Free.String())
+	case forge.CrownJobWaitingInQueue:
+	}
+	return ReasonInQueue, fmt.Sprintf(msgInQueue, workspace)
+}
+
+// queueState reads, with the API reader, the state of the job queue of the given Workspace: the quotas of its
+// ClusterQueue and what its workloads reserve, and what is free in the root Cohort (its pool, plus the nominal quotas
+// of its ClusterQueues, minus their reservations). A ClusterQueue outside the root Cohort is alone with its quotas.
+func (r *Reconciler) queueState(ctx context.Context, workspace string) (*forge.KueueQueueState, error) {
+	queue := &unstructured.Unstructured{}
+	queue.SetGroupVersionKind(forge.KueueClusterQueueGVK)
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: forge.CrownJobQueueName(workspace)}, queue); err != nil {
+		return nil, err
+	}
+	own, err := queueMemberState(queue)
+	if err != nil {
+		return nil, err
+	}
+
+	var pool []forge.KueueResourceQuota
+	members := []forge.KueueQueueState{*own}
+	if cohortName, _, _ := unstructured.NestedString(queue.Object, "spec", "cohortName"); cohortName == forge.CrownJobRootCohort {
+		cohort := &unstructured.Unstructured{}
+		cohort.SetGroupVersionKind(forge.KueueCohortGVK)
+		if err := r.APIReader.Get(ctx, types.NamespacedName{Name: forge.CrownJobRootCohort}, cohort); err != nil {
+			return nil, err
+		}
+		if pool, _, err = forge.KueueQuotas(cohort); err != nil {
+			return nil, err
+		}
+
+		queues := &unstructured.UnstructuredList{}
+		queues.SetGroupVersionKind(forge.KueueClusterQueueGVK.GroupVersion().WithKind(forge.KueueClusterQueueGVK.Kind + "List"))
+		if err := r.APIReader.List(ctx, queues, client.MatchingLabels{forge.LabelManagedByKey: forge.LabelManagedByCrownJobValue}); err != nil {
+			return nil, err
+		}
+		members = nil
+		for i := range queues.Items {
+			if cohortName, _, _ := unstructured.NestedString(queues.Items[i].Object, "spec", "cohortName"); cohortName != forge.CrownJobRootCohort {
 				continue
 			}
-			message, _ := condition["message"].(string)
-			return strings.Contains(strings.ToLower(message), kueueInsufficientQuota)
+			member, err := queueMemberState(&queues.Items[i])
+			if err != nil {
+				return nil, err
+			}
+			members = append(members, *member)
 		}
 	}
-	return false
+	own.Free = forge.KueueCohortFree(pool, members)
+	return own, nil
+}
+
+// queueMemberState returns the quotas of the given ClusterQueue and what its workloads reserve.
+func queueMemberState(queue *unstructured.Unstructured) (*forge.KueueQueueState, error) {
+	quotas, _, err := forge.KueueQuotas(queue)
+	if err != nil {
+		return nil, err
+	}
+	used, err := forge.KueueReservation(queue)
+	if err != nil {
+		return nil, err
+	}
+	return &forge.KueueQueueState{Quotas: quotas, Used: used}, nil
+}
+
+// nextWindowAllowing returns the next start of a job window of the Workspace whose maxAtOnce allows the given requests,
+// with the time zone of the windows, and false if there is none.
+func (r *Reconciler) nextWindowAllowing(ctx context.Context, workspaceName string, requests corev1.ResourceList) (time.Time, *time.Location, bool) {
+	var workspace clv1alpha1.Workspace
+	if found, err := r.read(ctx, types.NamespacedName{Name: workspaceName}, &workspace); err != nil || !found {
+		return time.Time{}, nil, false
+	}
+	loc, err := forge.JobTimeZone(workspace.Spec.JobPolicy, r.DefaultTimeZone)
+	if err != nil {
+		return time.Time{}, nil, false
+	}
+	start, found := forge.JobNextTimeAllowing(&workspace.Spec, loc, r.Clock.Now(), func(limits *clv1alpha1.QueueLimits) bool {
+		for name, requested := range requests {
+			if maximum := forge.KueueMaximum(limits, name); requested.Sign() > 0 && maximum != nil && requested.Cmp(*maximum) > 0 {
+				return false
+			}
+		}
+		return true
+	})
+	return start, loc, found
 }
 
 // jobPod returns the most recent pod of the given Job, or nil if it has none.

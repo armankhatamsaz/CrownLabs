@@ -15,6 +15,7 @@
 package forge
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"path"
@@ -295,6 +296,27 @@ func CrownJobCommand(templateJob *clv1alpha2.TemplateJob, crownJobCommand []stri
 // The limit is the smallest of the Template and Workspace values, or defaultMaxRunTime if neither is set.
 // The CrownJob value can only lower that limit: a larger value is refused.
 func CrownJobMaxRunTime(crownJobValue, templateValue, workspaceValue string, defaultMaxRunTime time.Duration) (time.Duration, error) {
+	limit, err := CrownJobMaxRunTimeLimit(templateValue, workspaceValue, defaultMaxRunTime)
+	if err != nil {
+		return 0, err
+	}
+	if crownJobValue == "" {
+		return limit, nil
+	}
+	requested, err := crownJobRequestedMaxRunTime(crownJobValue)
+	if err != nil {
+		return 0, err
+	}
+	if requested > limit {
+		return 0, NewCannotStartError("The job asks for a time limit of %s, but at most %s is allowed.",
+			crownJobValue, utils.FormatDurationWithDays(limit))
+	}
+	return requested, nil
+}
+
+// CrownJobMaxRunTimeLimit returns the maximum time a job may run when it does not ask for less: the smallest of the
+// Template and Workspace values set, or defaultMaxRunTime if neither is set.
+func CrownJobMaxRunTimeLimit(templateValue, workspaceValue string, defaultMaxRunTime time.Duration) (time.Duration, error) {
 	limit := time.Duration(0)
 	for _, value := range []string{templateValue, workspaceValue} {
 		if value == "" {
@@ -311,17 +333,50 @@ func CrownJobMaxRunTime(crownJobValue, templateValue, workspaceValue string, def
 	if limit == 0 {
 		limit = defaultMaxRunTime
 	}
+	return limit, nil
+}
 
-	if crownJobValue == "" {
-		return limit, nil
+// CrownJobMaxRunTimeAt returns the maximum time a job may run, as CrownJobMaxRunTime, with the maxRunTime of the
+// Workspace in force at now (see JobLimitsAt). If the CrownJob asks for more than that, and a later job window allows
+// it, the start of the first such window is returned instead, with a nil error: the job waits for it. If no window
+// allows it, a CannotStartError tells the largest limit of the defaults and of every window.
+func CrownJobMaxRunTimeAt(crownJobValue, templateValue string, spec *clv1alpha1.WorkspaceSpec, loc *time.Location,
+	now time.Time, defaultMaxRunTime time.Duration) (time.Duration, *time.Time, error) {
+	limits := JobLimitsAt(spec, loc, now)
+	maxRunTime, err := CrownJobMaxRunTime(crownJobValue, templateValue, limits.MaxRunTime, defaultMaxRunTime)
+	var cannotStart *CannotStartError
+	if err == nil || !errors.As(err, &cannotStart) || crownJobValue == "" {
+		return maxRunTime, nil, err
 	}
+	requested, parseErr := crownJobRequestedMaxRunTime(crownJobValue)
+	if parseErr != nil {
+		return 0, nil, parseErr
+	}
+
+	largest := time.Duration(0)
+	for _, all := range JobLimitsAll(spec, loc) {
+		limit, err := CrownJobMaxRunTimeLimit(templateValue, all.MaxRunTime, defaultMaxRunTime)
+		if err != nil {
+			return 0, nil, err
+		}
+		largest = max(largest, limit)
+	}
+	allows := func(limits *clv1alpha1.QueueLimits) bool {
+		limit, err := CrownJobMaxRunTimeLimit(templateValue, limits.MaxRunTime, defaultMaxRunTime)
+		return err == nil && requested <= limit
+	}
+	if start, found := JobNextTimeAllowing(spec, loc, now, allows); found && requested <= largest {
+		return requested, &start, nil
+	}
+	return 0, nil, NewCannotStartError("The job asks for a time limit of %s, but at most %s is allowed.",
+		crownJobValue, utils.FormatDurationWithDays(largest))
+}
+
+// crownJobRequestedMaxRunTime parses the maxRunTime of a CrownJob.
+func crownJobRequestedMaxRunTime(crownJobValue string) (time.Duration, error) {
 	requested, err := utils.ParseDurationWithDays(crownJobValue)
 	if err != nil {
 		return 0, NewCannotStartError("The time limit %s of the job is not valid.", crownJobValue)
-	}
-	if requested > limit {
-		return 0, NewCannotStartError("The job asks for a time limit of %s, but at most %s is allowed.",
-			crownJobValue, utils.FormatDurationWithDays(limit))
 	}
 	return requested, nil
 }
@@ -343,14 +398,13 @@ func PodEffectiveRequests(spec *corev1.PodSpec) corev1.ResourceList {
 	return requests
 }
 
-// CrownJobCheckQueueLimits checks the requests of a job against the job queue of the given Workspace: every requested
-// resource must be covered by the queue (see KueueQueueQuotas), and no request may exceed maxAtOnce, or the job could
-// never start.
-func CrownJobCheckQueueLimits(workspace string, limits *clv1alpha1.QueueLimits, requests corev1.ResourceList) error {
-	quotas := map[corev1.ResourceName]resource.Quantity{}
-	for _, quota := range KueueQueueQuotas(limits) {
-		quotas[quota.Name] = quota.Quota
-	}
+// CrownJobCheckQueueLimits checks the requests of a job against the job queue of the given Workspace, over the defaults
+// and every job window (none when loc is nil, as the windows then never apply), and against the job capacity: the job
+// could never start if it requests a resource that no limits allow (see KueueMaximum), more of it than the largest
+// maxAtOnce, or more than the capacity. A job above the maximum in force, but within that of a window, can start in
+// the window: it is accepted, and waits in the queue.
+func CrownJobCheckQueueLimits(workspace string, spec *clv1alpha1.WorkspaceSpec, loc *time.Location, capacity, requests corev1.ResourceList) error {
+	all := JobLimitsAll(spec, loc)
 
 	names := make([]string, 0, len(requests))
 	for name := range requests {
@@ -359,14 +413,28 @@ func CrownJobCheckQueueLimits(workspace string, limits *clv1alpha1.QueueLimits, 
 	sort.Strings(names)
 
 	for _, name := range names {
-		requested := requests[corev1.ResourceName(name)]
-		quota, found := quotas[corev1.ResourceName(name)]
-		if !found {
+		resourceName := corev1.ResourceName(name)
+		requested := requests[resourceName]
+		var largest *resource.Quantity
+		unlimited := false
+		for i := range all {
+			maximum := KueueMaximum(&all[i], resourceName)
+			if maximum == nil {
+				unlimited = true
+			} else if largest == nil || maximum.Cmp(*largest) > 0 {
+				largest = maximum
+			}
+		}
+		if !unlimited && largest.IsZero() {
 			return NewCannotStartError("The job queue of workspace %s does not allow %s.", workspace, name)
 		}
-		if requested.Cmp(quota) > 0 {
+		if !unlimited && requested.Cmp(*largest) > 0 {
 			return NewCannotStartError("The job asks for %s of %s, but the job queue of workspace %s allows at most %s at once: it could never start.",
-				requested.String(), name, workspace, quota.String())
+				requested.String(), name, workspace, largest.String())
+		}
+		if total, found := capacity[resourceName]; found && requested.Cmp(total) > 0 {
+			return NewCannotStartError("The job asks for %s of %s, but jobs can use at most %s in total: it could never start.",
+				requested.String(), name, total.String())
 		}
 	}
 	return nil
