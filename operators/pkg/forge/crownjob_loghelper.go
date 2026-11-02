@@ -236,6 +236,6 @@ func crownJobLogReaderMeta(namespace string) metav1.ObjectMeta {
 	return metav1.ObjectMeta{
 		Name:      CrownJobLogReaderName,
 		Namespace: namespace,
-		Labels:    map[string]string{LabelManagedByKey: labelManagedByCrownJobValue},
+		Labels:    map[string]string{LabelManagedByKey: LabelManagedByCrownJobValue},
 	}
 }

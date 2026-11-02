@@ -48,6 +48,9 @@ const (
 	// ReasonLogsNotSaved -> the reason of the event recorded when the log of a job pod could not be saved.
 	// It never changes the phase of the CrownJob.
 	ReasonLogsNotSaved = "LogsNotSaved"
+	// ReasonInvalidTimeZone -> the reason of the event recorded on a Workspace whose time zone is not valid: its job
+	// windows are ignored.
+	ReasonInvalidTimeZone = "InvalidTimeZone"
 )
 
 // The messages of the status of a CrownJob: plain sentences, for a student.
@@ -77,6 +80,7 @@ const (
 	msgJobDeleted       = "The job was deleted before it ended."
 	msgJobNameTaken     = "Another job named %s already exists in this namespace."
 	msgJobInvalid       = "The job could not be created: %s."
+	msgInvalidTimeZone  = "The time zone %s of the job windows is not valid: the windows are ignored, and the default limits apply."
 )
 
 const (

@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2/textlogger"
+	testingclock "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -76,6 +77,9 @@ var (
 	instanceReconciler crownjob.InstanceReconciler
 	testEnv            *envtest.Environment
 	stopManager        context.CancelFunc
+	// testClock is the clock of the reconcilers: Monday 2026-11-02, 12:00 in Rome, unless a test moves it.
+	testClock *testingclock.FakeClock
+	rome      *time.Location
 
 	targetLabel = ctrlcommon.NewLabel("crownlabs.polito.it/operator-selector", "test")
 )
@@ -109,6 +113,9 @@ var _ = BeforeSuite(func() {
 	Expect(k8sClient).NotTo(BeNil())
 
 	recorder = record.NewFakeRecorder(1024)
+	rome, err = time.LoadLocation("Europe/Rome")
+	Expect(err).ToNot(HaveOccurred())
+	testClock = testingclock.NewFakeClock(time.Date(2026, 11, 2, 12, 0, 0, 0, rome))
 	crownJobReconciler = crownjob.Reconciler{
 		Client:             k8sClient,
 		APIReader:          k8sClient,
@@ -122,7 +129,11 @@ var _ = BeforeSuite(func() {
 	}
 	queueReconciler = crownjob.QueueReconciler{
 		Client:             k8sClient,
+		APIReader:          k8sClient,
 		TargetLabel:        targetLabel,
+		EventsRecorder:     record.NewFakeRecorder(1024),
+		DefaultTimeZone:    time.UTC,
+		Clock:              testClock,
 		ReconcileDeferHook: GinkgoRecover,
 	}
 

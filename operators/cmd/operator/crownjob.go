@@ -17,8 +17,13 @@ package main
 import (
 	"flag"
 	"fmt"
+	"time"
+	_ "time/tzdata" // The time zones of the job windows: the image of the operator has no time zone database.
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	ctrlcommon "github.com/netgroup-polito/CrownLabs/operators/pkg/controller/common"
@@ -32,6 +37,8 @@ var (
 	crownJobDefaultMaxRunTime       string
 	crownJobLogHelperImage          string
 	crownJobFinishedJobTTL          string
+	crownJobCapacity                string
+	crownJobTimeZone                string
 	maxConcurrentCrownJobReconciles int
 )
 
@@ -48,6 +55,12 @@ func init() {
 		"The image of the Jobs that save the log of each job pod into its run folder (it must contain /go-runner and /bin/kubectl)")
 	flag.StringVar(&crownJobFinishedJobTTL, "crownjob-finished-job-ttl", "10m",
 		"How long the Job of a CrownJob, and each of its log helpers, is kept after it ends, with its pods, as a number followed by m, h or d (the CrownJob is kept)")
+	flag.StringVar(&crownJobCapacity, "crownjob-capacity", "",
+		"The most all the jobs may use at the same time, as a comma-separated list of resource=quantity (e.g., cpu=64,memory=256Gi,nvidia.com/gpu=8): "+
+			"the guarantees of the workspaces are taken from it, and the rest is shared. If empty, it is unlimited: every workspace can use up to its maxAtOnce, "+
+			"and the guarantees have no effect")
+	flag.StringVar(&crownJobTimeZone, "crownjob-time-zone", "UTC",
+		"The IANA time zone of the job windows of the workspaces whose jobPolicy sets none (e.g., Europe/Rome)")
 	flag.IntVar(&maxConcurrentCrownJobReconciles, "crownjob-max-concurrent-reconciles", 1,
 		"The maximum number of concurrent Reconciles which can be run for the CrownJob controllers")
 }
@@ -66,6 +79,14 @@ func setupCrownJob(mgr manager.Manager, targetLabel ctrlcommon.KVLabel) error {
 	finishedJobTTL, err := utils.ParseDurationWithDays(crownJobFinishedJobTTL)
 	if err != nil {
 		return fmt.Errorf("invalid value of --crownjob-finished-job-ttl: %w", err)
+	}
+	capacity, err := parseCapacity(crownJobCapacity)
+	if err != nil {
+		return fmt.Errorf("invalid value of --crownjob-capacity: %w", err)
+	}
+	timeZone, err := time.LoadLocation(crownJobTimeZone)
+	if err != nil || crownJobTimeZone == "Local" {
+		return fmt.Errorf("invalid value of --crownjob-time-zone: %q is not an IANA time zone (%w)", crownJobTimeZone, err)
 	}
 	if err := checkKueueKinds(mgr); err != nil {
 		return err
@@ -94,16 +115,41 @@ func setupCrownJob(mgr manager.Manager, targetLabel ctrlcommon.KVLabel) error {
 	}
 
 	return (&crownjob.QueueReconciler{
-		Client:      mgr.GetClient(),
-		TargetLabel: targetLabel,
+		Client:          mgr.GetClient(),
+		APIReader:       mgr.GetAPIReader(),
+		TargetLabel:     targetLabel,
+		EventsRecorder:  mgr.GetEventRecorderFor(crownJobCtrl),
+		Capacity:        capacity,
+		DefaultTimeZone: timeZone,
+		Clock:           clock.RealClock{},
 	}).SetupWithManager(mgr, maxConcurrentCrownJobReconciles)
+}
+
+// parseCapacity parses the job capacity, a comma-separated list of resource=quantity.
+func parseCapacity(value string) (corev1.ResourceList, error) {
+	pairs, err := forge.MapFromKVString(value)
+	if err != nil {
+		return nil, err
+	}
+	capacity := corev1.ResourceList{}
+	for name, raw := range pairs {
+		quantity, err := resource.ParseQuantity(raw)
+		if err != nil {
+			return nil, fmt.Errorf("the quantity of %s: %w", name, err)
+		}
+		if quantity.Sign() < 0 {
+			return nil, fmt.Errorf("the quantity of %s is negative", name)
+		}
+		capacity[corev1.ResourceName(name)] = quantity
+	}
+	return capacity, nil
 }
 
 // checkKueueKinds returns an error if the cluster does not serve the Kueue kinds used by the CrownJob controllers.
 func checkKueueKinds(mgr manager.Manager) error {
 	for _, gvk := range []schema.GroupVersionKind{
 		forge.KueueClusterQueueGVK, forge.KueueLocalQueueGVK, forge.KueueResourceFlavorGVK,
-		forge.KueueWorkloadPriorityClassGVK, forge.KueueWorkloadGVK,
+		forge.KueueWorkloadPriorityClassGVK, forge.KueueWorkloadGVK, forge.KueueCohortGVK,
 	} {
 		if _, err := mgr.GetRESTMapper().RESTMapping(gvk.GroupKind(), gvk.Version); err != nil {
 			return fmt.Errorf("the CrownJob controller needs Kueue, but the cluster does not serve %s %s (%w): install Kueue, or set --enable-crownjob=false",
