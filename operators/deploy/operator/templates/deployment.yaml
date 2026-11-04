@@ -81,6 +81,8 @@ spec:
             - "--crownjob-finished-job-ttl={{ .Values.configurations.crownJob.finishedJobTTL }}"
             - "--crownjob-log-helper-image={{ .Values.configurations.crownJob.logHelperImage }}"
             - "--crownjob-max-concurrent-reconciles={{ .Values.configurations.crownJob.maxConcurrentReconciles }}"
+            - "--crownjob-capacity={{ .Values.configurations.crownJob.capacity }}"
+            - "--crownjob-time-zone={{ .Values.configurations.crownJob.timeZone }}"
             {{- end }}
           ports:
             - name: metrics

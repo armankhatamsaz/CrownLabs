@@ -137,6 +137,11 @@ operator:
       # The image of the Jobs that save the log of each job pod: it must contain /go-runner and /bin/kubectl.
       logHelperImage: "registry.k8s.io/kubectl:v1.34.1"
       maxConcurrentReconciles: 1
+      # The resources all the jobs may use at the same time, shared by the job queues, as resource=quantity,...
+      # (e.g. cpu=64,memory=256Gi,nvidia.com/gpu=8). Empty means unlimited.
+      capacity: ""
+      # The time zone of the job windows of the Workspaces that set none (an IANA name, e.g. Europe/Rome).
+      timeZone: "UTC"
     keycloak:
       url: "https://auth.crownlabs.example.com/"
       realm: crownlabs
