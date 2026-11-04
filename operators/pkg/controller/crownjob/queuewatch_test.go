@@ -302,11 +302,14 @@ var _ = Describe("Queue positions and fresh waiting reasons (P12c)", func() {
 					return status(http.StatusNotFound, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`)
 				},
 				check: kerrors.IsNotFound}),
-			Entry("403: no permission", failureCase{
+			Entry("403: no permission, with the message of the API server", failureCase{
 				handler: func() http.HandlerFunc {
-					return status(http.StatusForbidden, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403}`)
+					return status(http.StatusForbidden, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403,
+						"message":"clusterqueues.visibility.kueue.x-k8s.io \"crownlabs-ws\" is forbidden: User \"system:serviceaccount:crownlabs:operator\" cannot get resource \"clusterqueues/pendingworkloads\""}`)
 				},
-				check: kerrors.IsForbidden}),
+				check: func(err error) bool {
+					return kerrors.IsForbidden(err) && strings.Contains(err.Error(), `cannot get resource "clusterqueues/pendingworkloads"`)
+				}}),
 			Entry("503 with Retry-After: the visibility server is down", failureCase{
 				handler: func() http.HandlerFunc {
 					return status(http.StatusServiceUnavailable, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"ServiceUnavailable","code":503}`,

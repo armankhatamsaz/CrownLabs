@@ -46,7 +46,13 @@ func NewVisibilityReader(client rest.Interface, timeout time.Duration) Visibilit
 func (v *restVisibilityReader) PendingWorkloads(ctx context.Context, clusterQueue string) ([]forge.KueuePendingWorkload, error) {
 	ctx, cancel := context.WithTimeout(ctx, v.timeout)
 	defer cancel()
-	data, err := v.client.Get().AbsPath(forge.KueuePendingWorkloadsPath(clusterQueue)).MaxRetries(0).DoRaw(ctx)
+	result := v.client.Get().AbsPath(forge.KueuePendingWorkloadsPath(clusterQueue)).MaxRetries(0).Do(ctx)
+	// Error decodes the Status sent by the API server (e.g., the permission that is missing), whereas the error of
+	// DoRaw has "unknown" as its message.
+	if err := result.Error(); err != nil {
+		return nil, err
+	}
+	data, err := result.Raw()
 	if err != nil {
 		return nil, err
 	}
