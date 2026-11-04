@@ -109,7 +109,7 @@ rules:
   verbs: ["create", "patch"]
 
 # Kueue: the ClusterQueue of each Workspace (watched, to restore it) and its LocalQueues, written with server-side
-# apply (create and patch), the shared ResourceFlavor; the Workloads and the priority classes are only read.
+# apply (create and patch), the shared ResourceFlavor; the priority classes are only read.
 - apiGroups: ["kueue.x-k8s.io"]
   resources: ["clusterqueues"]
   verbs: ["get", "list", "watch", "create", "patch", "delete"]
@@ -120,9 +120,18 @@ rules:
   resources: ["resourceflavors"]
   verbs: ["get", "create"]
 - apiGroups: ["kueue.x-k8s.io"]
-  resources: ["workloads"]
-  verbs: ["list"]
-- apiGroups: ["kueue.x-k8s.io"]
   resources: ["workloadpriorityclasses"]
+  verbs: ["get"]
+
+# The root Cohort crownlabs-jobs, which holds the job capacity shared by the ClusterQueues: watched (to restore it),
+# read without cache, and written with server-side apply; it is never deleted. Without list and watch the cache of
+# the operator never syncs, and none of its controllers starts.
+- apiGroups: ["kueue.x-k8s.io"]
+  resources: ["cohorts"]
+  verbs: ["get", "list", "watch", "create", "patch"]
+
+# The position of each waiting job, read from the pending workloads of its ClusterQueue in the visibility API of Kueue.
+- apiGroups: ["visibility.kueue.x-k8s.io"]
+  resources: ["clusterqueues/pendingworkloads"]
   verbs: ["get"]
 {{- end }}
