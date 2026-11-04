@@ -143,8 +143,9 @@ spec:
                           pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                           x-kubernetes-int-or-string: true
                         description: |-
-                          The maximum amount of resources that one member may use in total across
-                          all of their running jobs, by resource name.
+                          The maximum amount of resources that one member may have in the job
+                          queue of this Workspace, waiting or running at the same time, by
+                          resource name.
                         type: object
                     type: object
                 type: object
@@ -303,8 +304,9 @@ spec:
                                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                                 x-kubernetes-int-or-string: true
                               description: |-
-                                The maximum amount of resources that one member may use in total across
-                                all of their running jobs, by resource name.
+                                The maximum amount of resources that one member may have in the job
+                                queue of this Workspace, waiting or running at the same time, by
+                                resource name.
                               type: object
                           type: object
                       type: object

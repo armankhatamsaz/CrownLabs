@@ -134,8 +134,9 @@ type QueueLimits struct {
 
 // PerUserLimits defines the job queue limits that apply to each member of a Workspace.
 type PerUserLimits struct {
-	// The maximum amount of resources that one member may use in total across
-	// all of their running jobs, by resource name.
+	// The maximum amount of resources that one member may have in the job
+	// queue of this Workspace, waiting or running at the same time, by
+	// resource name.
 	Resources map[string]resource.Quantity `json:"resources,omitempty"`
 
 	// +kubebuilder:validation:Minimum:=1
