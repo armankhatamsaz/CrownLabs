@@ -773,7 +773,7 @@ kubectl get datavolume,pvc ubuntu-lab-snapshot -n crownlabs-public-snapshots
 The CrownJob controllers run each `CrownJob` (see the [Job API](#job-api)) as a batch Job queued by [Kueue](https://kueue.sigs.k8s.io/). They run in the main `operator` process, and are disabled by default:
 
 - `crownjob` ([reconciler.go](pkg/controller/crownjob/reconciler.go)) checks a new CrownJob, creates its Job and keeps its `status` up to date;
-- `crownjob-queue` ([queue.go](pkg/controller/crownjob/queue.go)) turns the `queueLimits` of each Workspace into the Kueue ClusterQueue `crownlabs-<workspace>`;
+- `crownjob-queue` ([queue.go](pkg/controller/crownjob/queue.go)) turns the `queueLimits` and `windows` of each Workspace into the Kueue ClusterQueue `crownlabs-<workspace>`, and the job capacity into the root Cohort `crownlabs-jobs` that they share;
 - `crownjob-instance` ([instance.go](pkg/controller/crownjob/instance.go)) keeps an Instance while its jobs run.
 
 The Job is forged in [crownjobs.go](pkg/forge/crownjobs.go), and the Kueue objects in [kueue.go](pkg/forge/kueue.go) as unstructured objects: the operator has no Go dependency on Kueue.
@@ -793,19 +793,28 @@ The Job is forged in [crownjobs.go](pkg/forge/crownjobs.go), and the Kueue objec
 | `phase` | `reason` | meaning |
 | --- | --- | --- |
 | `Waiting` | `InQueue`, `QuotaReached` | In the queue; the queue uses all its resources. |
+| `Waiting` | `GuaranteeInUse`, `CapacityReached`, `LargerThanFree` | In the queue; other Workspaces use the share guaranteed to this one; all the job capacity is in use; the job needs more than is free, and smaller jobs may start first. |
+| `Waiting` | `WaitingForWindow`, `UserLimitReached` | Only a job window allows the job (its `maxRunTime` or its size); the member's own limit is reached. The Job may not exist yet. |
 | `Waiting` | `InstanceNotReady`, `DiskInUse`, `QueueNotReady` | The Job does not exist yet (step 2). |
 | `Starting` | `Admitted` | Admitted, and the pod is not running yet; the message says when the image is being downloaded (a `Pulling` event of the kubelet with no later `Pulled`). |
 | `Running` | `Running` | The pod runs; `deadline` is the start of its pod plus `maxRunTime` (the set-up is included). |
 | `Succeeded` | `Completed` | The command succeeded. |
 | `Failed` | `ExitCode`, `TimeLimit`, `CannotStart`, `Canceled`, `Error` | The command failed; the time limit was reached; the job was refused, or its pod was rejected or evicted; the Instance was deleted before the job started; any other failure. |
 
-`message` is a sentence for the user, e.g. "Your command ended with exit code 3. The output is saved in runs/train-1/log.txt.". Each phase change is also an event of the CrownJob. A final status is written as soon as the Job ends, and changes once at most: when the log helper of the first pod has ended, " The output is saved in runs/<name>/log.txt." (or, if it failed, " The output could not be saved.") is appended to its message. `queuePosition` and `conditions` are not set yet.
+`message` is a sentence for the user, e.g. "Your command ended with exit code 3. The output is saved in runs/train-1/log.txt.". Each phase change is also an event of the CrownJob. A final status is written as soon as the Job ends, and changes once at most: when the log helper of the first pod has ended, " The output is saved in runs/<name>/log.txt." (or, if it failed, " The output could not be saved.") is appended to its message. `queuePosition` is set while the Job waits in the queue (see below); `conditions` are not set yet.
 
-Known limits of the waiting reasons, fixed by the follow-up pull request on queue policies: the reason is read from the Kueue Workload of each job, so identical waiting jobs may read `InQueue` instead of `QuotaReached` (Kueue gives no condition to identical Workloads after the first); a reason may lag by up to 30 s, since the Workloads are not watched; and events are recorded on phase changes only, so a change from `InQueue` to `QuotaReached` has no event.
+The reason of a waiting job is computed from the state of the job queues, not read from its Kueue Workload, and it is refreshed at each status change of a job queue, not only at the next check (see "Waiting reasons and position" below): identical waiting jobs read the same reason, and a reason follows the queue as it changes. Events are still recorded on phase changes only, so a change from `InQueue` to `QuotaReached` has no event.
+
+### Queue policies
+
+- **Windows.** The limits in force are the defaults of `queueLimits`, changed by the first window, in list order, that covers the current time: its days and `[start, end)` on the wall clock of `jobPolicy.timeZone`, or else of `--crownjob-time-zone`. Each field set in its `overrides` replaces the default as a whole. On a daylight saving change, a start or end that the clock skips takes effect at the jump, and one in the repeated hour takes effect twice. The queues are updated at each start and end (plus 1 s). A job that only a window allows waits as `WaitingForWindow` until the next one: in the queue when its size needs the window, without a Job when its `maxRunTime` or the per-user limit does.
+- **Shared capacity.** `--crownjob-capacity` (e.g. `cpu=64,memory=256Gi,nvidia.com/gpu=8`) is shared by all the job queues through the root Cohort `crownlabs-jobs`. For each resource in it, the `guaranteed` amount of a Workspace is the nominal quota of its ClusterQueue, `maxAtOnce` minus that amount is its borrowing limit, and what no Workspace is guaranteed is the pool of the Cohort. An idle guarantee is lent to the other Workspaces and comes back as their jobs end: no job is ever preempted. If the guarantees exceed the capacity, they are served in Workspace name order, and each one cut is reported by a `GuaranteeCut` warning event on its Workspace (`GuaranteeAboveMaximum` for a guarantee above `maxAtOnce`). A resource outside the capacity is not borrowed: its nominal quota is `maxAtOnce` (memory, which every job requests, would otherwise make every job a borrower, and Kueue serves first the jobs that borrow nothing). Without a capacity, each ClusterQueue has its `maxAtOnce`, as before. Every quota decrease is applied before any increase, so the sum of the quotas never exceeds the capacity.
+- **Per-user limit.** `perUser.resources` is held by the operator, not by Kueue: it counts the jobs of the member (the tenant namespace) in the queue of the Workspace, waiting or running. A job that would go above it has no Job and waits as `UserLimitReached`, with no queue position. When one of the member's jobs ends, their oldest held job gets its Job, which joins the queue at the back, behind the jobs other members sent meanwhile. A job above the largest `perUser` of the defaults and windows fails at once (`CannotStart`). `perUser.maxActiveJobs` is not enforced yet.
+- **Waiting reasons and position.** The reason of a waiting job is computed from the state of the queues (quotas, reservations and the pool), since Kueue gives one message for several causes and none to identical waiting jobs; it is refreshed at each status change of a job queue. `queuePosition` is the `positionInClusterQueue` of the job's Workload in the visibility API of Kueue, plus 1 (never `positionInLocalQueue`, which Kueue counts per LocalQueue name, the same in every tenant namespace). It is not a promise: a job that needs more than is free can stay first while smaller jobs start. If the visibility API cannot be read, `queuePosition` is left empty and the operator logs the error at most once a minute per Workspace.
 
 ### Requirements and configuration
 
-The controllers need Kueue serving `kueue.x-k8s.io/v1beta2` (tested with v0.18.3) with the `batch/job` integration, and `manageJobsWithoutQueueName: false` (the default): the log helpers have no queue name. With `--enable-crownjob`, the operator stops at startup if the cluster does not serve the ClusterQueue, LocalQueue, ResourceFlavor, WorkloadPriorityClass and Workload kinds.
+The controllers need Kueue serving `kueue.x-k8s.io/v1beta2` (tested with v0.18.3) with the `batch/job` integration, and `manageJobsWithoutQueueName: false` (the default): the log helpers have no queue name. With `--enable-crownjob`, the operator stops at startup if the cluster does not serve the ClusterQueue, LocalQueue, ResourceFlavor, WorkloadPriorityClass, Workload and Cohort kinds. The queue positions need the visibility API of Kueue (`visibility.kueue.x-k8s.io/v1beta2`).
 
 | CLI flag | Default | Helm value (umbrella chart) |
 | --- | --- | --- |
@@ -815,9 +824,11 @@ The controllers need Kueue serving `kueue.x-k8s.io/v1beta2` (tested with v0.18.3
 | `--crownjob-finished-job-ttl` | `10m` | `operator.configurations.crownJob.finishedJobTTL` |
 | `--crownjob-log-helper-image` | `registry.k8s.io/kubectl:v1.34.1` | `operator.configurations.crownJob.logHelperImage` |
 | `--crownjob-max-concurrent-reconciles` | `1` | `operator.configurations.crownJob.maxConcurrentReconciles` |
+| `--crownjob-capacity` | Empty (unlimited) | `operator.configurations.crownJob.capacity` (e.g. `cpu=64,memory=256Gi`) |
+| `--crownjob-time-zone` | `UTC` | `operator.configurations.crownJob.timeZone` (an IANA name, e.g. `Europe/Rome`) |
 | `--job-storage-class` (instance operator) | Empty | `instance-operator.configurations.jobStorageClass` |
 
-With `features.crownJob: false` the chart passes none of the operator flags. Durations are a number followed by `m`, `h` or `d`.
+With `features.crownJob: false` the chart passes none of the operator flags. Durations are a number followed by `m`, `h` or `d`. With `helm --set`, escape the commas of the capacity (`cpu=64\,memory=256Gi`).
 
 ### Changes in other components
 
@@ -834,6 +845,7 @@ Finished Jobs and helpers are deleted after `--crownjob-finished-job-ttl`, with 
 ### Access control
 
 - The operator ClusterRole has a CrownJob section, rendered only with `features.crownJob: true`: the Jobs (including `delete`), the pods (`list`; `get` and `pods/log` are needed to create the Role of the log helpers), the events, the Deployments (read, and watched: `list` and `watch`) and disks (read), the ServiceAccount, Role and RoleBinding of the log helpers, and the Kueue objects. Its `crownjobs` rule is always rendered, since the operator binds `crownlabs-manage-instances`.
+- For the queue policies, it also grants the Kueue Cohorts (`get`, `list`, `watch`, `create`, `patch`; without `list` and `watch` the cache of the operator never syncs and none of its controllers starts) and `get` on `clusterqueues/pendingworkloads` of `visibility.kueue.x-k8s.io` (the queue positions).
 - `crownlabs-manage-instances` lets tenants `get`, `list`, `watch`, `create`, `delete` and `deletecollection` CrownJobs; neither `update` nor `patch` (the `spec` is immutable), nor the `status`. Workspace managers get it in every namespace, as for instances. `crownlabs-view-instances` reads CrownJobs and their status.
 
 ### Operational notes
