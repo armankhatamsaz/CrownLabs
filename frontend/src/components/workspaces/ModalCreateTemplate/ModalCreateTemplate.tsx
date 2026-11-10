@@ -20,6 +20,7 @@ import {
   Typography,
   Space,
   Flex,
+  Alert,
 } from 'antd';
 import { Button } from 'antd';
 import type { CreateTemplateMutation } from '../../../generated-types';
@@ -40,6 +41,7 @@ import { ErrorContext } from '../../../errorHandling/ErrorContext';
 import { makeGuiSharedVolume } from '../../../utilsLogic';
 import { cleanupLabels, type SharedVolume } from '../../../utils';
 import { EnvironmentList } from './EnvironmentList';
+import { saveErrorTexts } from './templateJob';
 import type { Interval, TemplateForm } from './types';
 import {
   formItemLayout,
@@ -145,6 +147,9 @@ const ModalCreateTemplate: FC<IModalCreateTemplateProps> = ({ ...props }) => {
 
   const [form] = Form.useForm<TemplateForm>();
   const environments = Form.useWatch('environments', form);
+  // The words of the API when a save is refused, shown in the editor (U1D-2).
+  const [apiErrors, setApiErrors] = useState<string[]>([]);
+  const [submitting, setSubmitting] = useState(false);
   const isPersistent =
     (
       environments ??
@@ -208,6 +213,7 @@ const ModalCreateTemplate: FC<IModalCreateTemplateProps> = ({ ...props }) => {
   };
 
   const closehandler = () => {
+    setApiErrors([]);
     form.resetFields();
     setShow(false);
   };
@@ -311,9 +317,17 @@ const ModalCreateTemplate: FC<IModalCreateTemplateProps> = ({ ...props }) => {
         nodeSelector: nodeSelectorObject,
       }),
     };
+    setApiErrors([]);
+    setSubmitting(true);
     try {
+      const result = await submitHandler(parsedTemplate);
+      // With onError on the hook, a refused save resolves with the error.
+      const refused = saveErrorTexts(result?.errors);
+      if (refused.length > 0) {
+        setApiErrors(refused);
+        return;
+      }
       setShow(false);
-      await submitHandler(parsedTemplate);
 
       form.resetFields();
       setTimeouts({
@@ -326,6 +340,9 @@ const ModalCreateTemplate: FC<IModalCreateTemplateProps> = ({ ...props }) => {
     } catch (error) {
       console.error('ModalCreateTemplate submitHandler error:', error);
       apolloErrorCatcher(error as ApolloError);
+      setApiErrors(saveErrorTexts(error));
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -398,6 +415,10 @@ const ModalCreateTemplate: FC<IModalCreateTemplateProps> = ({ ...props }) => {
     fetchPolicy: 'cache-first',
     skip: !show, // Only fetch when modal is open
   });
+
+  useEffect(() => {
+    if (show) setApiErrors([]);
+  }, [show]);
 
   useEffect(() => {
     if (!show) return;
@@ -1206,6 +1227,17 @@ const ModalCreateTemplate: FC<IModalCreateTemplateProps> = ({ ...props }) => {
           defaultActiveKey={['1']}
         />
 
+        {apiErrors.length > 0 && (
+          <Alert
+            className="mb-4"
+            type="error"
+            showIcon
+            message={apiErrors.map(text => (
+              <div key={text}>{text}</div>
+            ))}
+          />
+        )}
+
         <div className="flex justify-end gap-2">
           <Button type="default" onClick={() => closehandler()}>
             Cancel
@@ -1257,6 +1289,7 @@ const ModalCreateTemplate: FC<IModalCreateTemplateProps> = ({ ...props }) => {
                     htmlType="submit"
                     type="primary"
                     disabled={isDisabled}
+                    loading={submitting}
                   >
                     {!loading && (template ? 'Modify' : 'Create')}
                   </Button>
