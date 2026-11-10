@@ -10,6 +10,7 @@ mutation createTemplate(
   $cleanupDeleteAfterInactivity: String!
   $allowPublicExposure: Boolean
   $nodeSelector: JSON
+  $job: JobInput
 ) {
   createdTemplate: createCrownlabsPolitoItV1alpha2NamespacedTemplate(
     namespace: $workspaceNamespace
@@ -27,6 +28,7 @@ mutation createTemplate(
         environmentList: $environmentList
         allowPublicExposure: $allowPublicExposure
         nodeSelector: $nodeSelector
+        job: $job
         workspaceCrownlabsPolitoItWorkspaceRef: { name: $workspaceId }
       }
       metadata: { generateName: $templateId, namespace: $workspaceNamespace }

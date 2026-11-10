@@ -13,6 +13,13 @@ query workspaceTemplates($workspaceNamespace: String!) {
           deleteAfterInactivity
         }
         nodeSelector
+        job {
+          environmentName
+          commandPolicy
+          command
+          maxRunTime
+          otherResources
+        }
         environmentList {
           name
           environmentType
