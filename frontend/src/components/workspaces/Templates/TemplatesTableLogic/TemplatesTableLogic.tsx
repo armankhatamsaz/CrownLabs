@@ -41,6 +41,12 @@ import {
   isInImageList,
   useImageLists,
 } from '../../ModalCreateTemplate/utils';
+import {
+  templateFormJob,
+  templateJobFromForm,
+  templateJobPatch,
+  templateJobSpec,
+} from '../../ModalCreateTemplate/templateJob';
 import { OwnedInstancesContext } from '../../../../contexts/OwnedInstancesContext';
 
 export interface ITemplateTableLogicProps {
@@ -329,6 +335,10 @@ const TemplatesTableLogic: FC<ITemplateTableLogicProps> = ({ ...props }) => {
         });
       }
 
+      patches.push(
+        ...templateJobPatch(t.savedJob, templateJobFromForm(t.job, t.savedJob)),
+      );
+
       return await applyTemplateJsonPatchMutation({
         variables: {
           workspaceNamespace,
@@ -405,8 +415,12 @@ const TemplatesTableLogic: FC<ITemplateTableLogicProps> = ({ ...props }) => {
                       t => t?.metadata?.name === template.id,
                     );
 
+                  const savedJob = templateJobSpec(rawTemplate?.spec?.job);
+
                   const templateForm: TemplateForm = {
                     name: template.name,
+                    job: templateFormJob(savedJob),
+                    savedJob,
                     nodeSelector: template.nodeSelector,
                     description: template.description ?? template.name,
                     cleanup: template.cleanup,
@@ -514,6 +528,7 @@ const TemplatesTableLogic: FC<ITemplateTableLogicProps> = ({ ...props }) => {
                 submitHandler={submitPatchHandler}
                 loading={false}
                 isPersonal={isPersonal}
+                workspaceName={workspaceName}
               />
             </div>
           ) : (

@@ -15,6 +15,7 @@ import UserListLogic from '../../accountPage/UserListLogic/UserListLogic';
 import Box from '../../common/Box';
 import ModalCreateTemplate from '../ModalCreateTemplate';
 import type { Template } from '../ModalCreateTemplate/ModalCreateTemplate';
+import { templateJobFromForm } from '../ModalCreateTemplate/templateJob';
 import { TemplatesTableLogic } from '../Templates/TemplatesTableLogic';
 import QuotaDisplay from '../QuotaDisplay';
 import WorkspaceImagesContextProvider from '../../../contexts/WorkspaceImagesContextProvider';
@@ -102,6 +103,8 @@ const WorkspaceContainer: FC<IWorkspaceContainerProps> = ({ ...props }) => {
       environmentList.push(env);
     }
 
+    const job = templateJobFromForm(t.job);
+
     return createTemplateMutation({
       variables: {
         workspaceId: workspace.name,
@@ -116,6 +119,8 @@ const WorkspaceContainer: FC<IWorkspaceContainerProps> = ({ ...props }) => {
           t.cleanup?.deleteAfterInactivity ?? 'never',
         allowPublicExposure: t.allowPublicExposure,
         ...(t.nodeSelector !== null && { nodeSelector: t.nodeSelector }),
+        // Only when jobs are on: without it, the Template has no job section.
+        ...(job && { job }),
       },
     }).catch(error => {
       console.error('WorkspaceContainer createTemplateMutation error:', error);
@@ -135,6 +140,7 @@ const WorkspaceContainer: FC<IWorkspaceContainerProps> = ({ ...props }) => {
         submitHandler={submitHandler}
         loading={loading}
         isPersonal={isPersonal}
+        workspaceName={workspace.name}
       />
       <Box
         header={{
