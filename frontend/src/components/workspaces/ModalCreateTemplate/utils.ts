@@ -11,6 +11,7 @@ import {
 } from '../../../generated-types';
 import type { Template } from './ModalCreateTemplate';
 import type { TemplateFormEnv, Image, ImageList, Resources } from './types';
+import { templateFormJob } from './templateJob';
 import { useMemo } from 'react';
 import type { ApolloError, QueryHookOptions } from '@apollo/client';
 
@@ -68,6 +69,7 @@ export const getDefaultTemplate = (resources: Resources): Template => {
       deleteAfterInactivity: 'never',
     },
     allowPublicExposure: false,
+    job: templateFormJob(null),
   };
 };
 

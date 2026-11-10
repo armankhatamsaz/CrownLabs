@@ -41,6 +41,7 @@ import { ErrorContext } from '../../../errorHandling/ErrorContext';
 import { makeGuiSharedVolume } from '../../../utilsLogic';
 import { cleanupLabels, type SharedVolume } from '../../../utils';
 import { EnvironmentList } from './EnvironmentList';
+import { JobSection } from './JobSection';
 import { saveErrorTexts } from './templateJob';
 import type { Interval, TemplateForm } from './types';
 import {
@@ -73,6 +74,8 @@ export interface IModalCreateTemplateProps {
   >;
   loading: boolean;
   isPersonal?: boolean;
+  // The Workspace of the Template: its job queue limits the time of a job.
+  workspaceName?: string;
 }
 
 const STATUS_ICON_COLORS = {
@@ -121,6 +124,7 @@ const ModalCreateTemplate: FC<IModalCreateTemplateProps> = ({ ...props }) => {
     loading,
     workspaceNamespace,
     isPersonal,
+    workspaceName,
   } = props;
 
   const { apolloErrorCatcher } = useContext(ErrorContext);
@@ -147,6 +151,7 @@ const ModalCreateTemplate: FC<IModalCreateTemplateProps> = ({ ...props }) => {
 
   const [form] = Form.useForm<TemplateForm>();
   const environments = Form.useWatch('environments', form);
+  const jobsEnabled: boolean = Form.useWatch(['job', 'enabled'], form) ?? false;
   // The words of the API when a save is refused, shown in the editor (U1D-2).
   const [apiErrors, setApiErrors] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
@@ -316,6 +321,7 @@ const ModalCreateTemplate: FC<IModalCreateTemplateProps> = ({ ...props }) => {
       ...(nodeSelectorObject !== undefined && {
         nodeSelector: nodeSelectorObject,
       }),
+      savedJob: props.template?.savedJob,
     };
     setApiErrors([]);
     setSubmitting(true);
@@ -1223,6 +1229,29 @@ const ModalCreateTemplate: FC<IModalCreateTemplateProps> = ({ ...props }) => {
                 </>
               ),
             },
+            // A personal workspace has no job queue: the operator refuses its jobs.
+            ...(isPersonal
+              ? []
+              : [
+                  {
+                    key: '4',
+                    label: <Typography.Text strong>Jobs</Typography.Text>,
+                    children: (
+                      <JobSection
+                        workspaceName={workspaceName}
+                        savedJob={template?.savedJob}
+                        show={show}
+                      />
+                    ),
+                    forceRender: true,
+                    style: panelStyle,
+                    extra: (
+                      <Text keyboard>
+                        Jobs <StatusIcon active={jobsEnabled} />
+                      </Text>
+                    ),
+                  },
+                ]),
           ]}
           defaultActiveKey={['1']}
         />
