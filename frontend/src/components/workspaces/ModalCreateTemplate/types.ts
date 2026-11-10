@@ -1,4 +1,4 @@
-import type { EnvironmentType } from '../../../generated-types';
+import type { CommandPolicy, EnvironmentType } from '../../../generated-types';
 
 export type Interval = {
   max: number;
@@ -22,6 +22,31 @@ export type TemplateForm = {
   };
   allowPublicExposure: boolean;
   nodeSelector?: Record<string, string> | null;
+  // The Jobs section; absent where the section is not shown.
+  job?: TemplateFormJob;
+  // On edit, spec.job as it was read: the parts the form does not show are
+  // kept from it, and the patch is computed against it.
+  savedJob?: TemplateJobSpec | null;
+};
+
+// spec.job, as the API holds it.
+export type TemplateJobSpec = {
+  environmentName: string;
+  commandPolicy: CommandPolicy;
+  command?: string[];
+  maxRunTime?: string;
+  otherResources?: Record<string, string>;
+};
+
+export type TemplateFormJob = {
+  enabled: boolean;
+  environmentName?: string;
+  commandPolicy: CommandPolicy;
+  // The script run with sh -c.
+  commandText?: string;
+  maxRunTime?: string;
+  // By the keys of the environment's widget (e.g., nvidiaComGpu).
+  otherResources?: Record<string, number | null | undefined>;
 };
 
 export type TemplateFormEnv = {
